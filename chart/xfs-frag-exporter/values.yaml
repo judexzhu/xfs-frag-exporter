@@ -31,8 +31,9 @@ securityContext:
   readOnlyRootFilesystem: true
   capabilities:
     drop: ["ALL"]
-  seccompProfile:
-    type: RuntimeDefault
+  # No seccompProfile set: the OpenShift hostmount-anyuid SCC forbids specifying
+  # one, and CRI-O applies RuntimeDefault by default anyway. On vanilla k8s you
+  # may add `seccompProfile: {type: RuntimeDefault}` here.
 
 nodeSelector:
   kubernetes.io/os: linux

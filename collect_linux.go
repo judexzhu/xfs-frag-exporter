@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -104,20 +103,22 @@ type xfsMount struct {
 	openPath   string // path to open from inside the container (hostRoot + mountpoint)
 }
 
-// discoverXFSMounts parses the host's mountinfo (via hostRoot/proc/1/mountinfo,
-// falling back to our own when running directly on the host) and returns each
-// distinct XFS mount.
+// discoverXFSMounts returns one entry per host XFS filesystem. With the node
+// root bind-mounted at hostRoot (mountPropagation HostToContainer), the host's
+// filesystems appear in our OWN mountinfo under hostRoot (e.g. /host/var) — which
+// is always readable, unlike the host pid-1 mountinfo a non-root pod may not
+// access. Free space is a property of the filesystem, not the mount, so we dedupe
+// by device (maj:min): RHCOS binds one XFS at /, /var, /etc, /sysroot and many
+// kubelet subpaths — all the same free space.
 func discoverXFSMounts(hostRoot string) ([]xfsMount, error) {
-	f, err := os.Open(filepath.Join(hostRoot, "proc", "1", "mountinfo"))
+	f, err := os.Open("/proc/self/mountinfo")
 	if err != nil {
-		if f, err = os.Open("/proc/self/mountinfo"); err != nil {
-			return nil, fmt.Errorf("read mountinfo: %w", err)
-		}
+		return nil, fmt.Errorf("read mountinfo: %w", err)
 	}
 	defer f.Close()
 
 	var mounts []xfsMount
-	seen := map[string]bool{}
+	seenDev := map[string]bool{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		// mountinfo: "<id> <pid> <maj:min> <root> <mountpoint> ... - <fstype> <source> <opts>"
@@ -131,15 +132,26 @@ func discoverXFSMounts(hostRoot string) ([]xfsMount, error) {
 		if len(left) < 5 || len(right) < 2 || right[0] != "xfs" {
 			continue
 		}
-		mountpoint := unescapeMountinfo(left[4])
-		if seen[mountpoint] {
+		openPath := unescapeMountinfo(left[4])
+		// Only host filesystems (under hostRoot); skip our own container mounts
+		// like /etc/hosts and /dev/termination-log.
+		if openPath != hostRoot && !strings.HasPrefix(openPath, hostRoot+"/") {
 			continue
 		}
-		seen[mountpoint] = true
+		majmin := left[2]
+		if seenDev[majmin] {
+			continue // same filesystem, same free space
+		}
+		seenDev[majmin] = true
+
+		label := strings.TrimPrefix(openPath, hostRoot)
+		if label == "" {
+			label = "/"
+		}
 		mounts = append(mounts, xfsMount{
-			mountpoint: mountpoint,
+			mountpoint: label, // host-absolute path
 			device:     unescapeMountinfo(right[1]),
-			openPath:   filepath.Join(hostRoot, mountpoint),
+			openPath:   openPath, // already under hostRoot
 		})
 	}
 	return mounts, sc.Err()
