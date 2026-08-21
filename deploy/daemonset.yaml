@@ -31,6 +31,10 @@ spec:
             - name: metrics
               containerPort: 9101
           env:
+            - name: NODE_NAME # labels every series so you can tell which node is sick
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: HOST_ROOT
               value: /host
             - name: SCRAPE_INTERVAL

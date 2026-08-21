@@ -14,6 +14,7 @@ apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: xfs-frag-exporter
+  namespace: xfs-frag-exporter
   labels:
     role: alert-rules
 spec:

@@ -11,7 +11,7 @@ research behind it, and [`docs/adr/`](./docs/adr) for the load-bearing decisions
 
 ## What it does
 
-Per XFS mount (labelled `mountpoint` + `device`) it exposes:
+Per XFS mount (labelled `node` + `mountpoint` + `device`) it exposes:
 
 | Metric | Meaning |
 |---|---|

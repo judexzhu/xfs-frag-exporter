@@ -25,7 +25,7 @@ func main() {
 	hostRoot := env("HOST_ROOT", "/host")
 	interval := envDuration("SCRAPE_INTERVAL", 300*time.Second)
 
-	c := &collector{hostRoot: hostRoot}
+	c := &collector{hostRoot: hostRoot, node: env("NODE_NAME", "")}
 	c.refresh() // populate before serving so /metrics has data immediately
 
 	go func() {
@@ -41,7 +41,7 @@ func main() {
 		io.WriteString(w, "xfs-frag-exporter\nsee /metrics\n")
 	})
 
-	log.Printf("listening on %s (host root %q, interval %s)", addr, hostRoot, interval)
+	log.Printf("listening on %s (node %q, host root %q, interval %s)", addr, c.node, hostRoot, interval)
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
@@ -55,6 +55,7 @@ type mountResult struct {
 
 type collector struct {
 	hostRoot string
+	node     string // node name (downward-API NODE_NAME); labels every series
 	mu       sync.RWMutex
 	snapshot []mountResult
 }
@@ -92,50 +93,55 @@ func (c *collector) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
-	writeExposition(bw, snap)
+	writeExposition(bw, c.node, snap)
 }
 
 // writeExposition renders the snapshot in the Prometheus text format. Value
 // gauges are emitted only for mounts whose walk succeeded; success/duration are
 // always emitted so a failing mount is still visible.
-func writeExposition(w io.Writer, snap []mountResult) {
+func writeExposition(w io.Writer, node string, snap []mountResult) {
 	gauge(w, "xfs_frag_density_extents_per_gib",
 		"Free extents per GiB of free space; its rate of change identifies sick nodes.",
-		snap, func(r mountResult) (float64, bool) { return r.stats.Density(), r.success })
+		node, snap, func(r mountResult) (float64, bool) { return r.stats.Density(), r.success })
 
 	gauge(w, "xfs_free_extent_max_bytes",
 		"Largest contiguous free extent in bytes (gates large allocation; ceilinged at agsize).",
-		snap, func(r mountResult) (float64, bool) { return float64(r.stats.MaxBytes), r.success })
+		node, snap, func(r mountResult) (float64, bool) { return float64(r.stats.MaxBytes), r.success })
 
 	gauge(w, "xfs_free_extents",
 		"Number of free extents.",
-		snap, func(r mountResult) (float64, bool) { return float64(r.stats.Extents), r.success })
+		node, snap, func(r mountResult) (float64, bool) { return float64(r.stats.Extents), r.success })
 
 	gauge(w, "xfs_free_bytes",
 		"Total free space in bytes (sum of free extents).",
-		snap, func(r mountResult) (float64, bool) { return float64(r.stats.FreeBytes), r.success })
+		node, snap, func(r mountResult) (float64, bool) { return float64(r.stats.FreeBytes), r.success })
 
 	gauge(w, "xfs_freesp_scrape_duration_seconds",
 		"Seconds spent in the GETFSMAP walk.",
-		snap, func(r mountResult) (float64, bool) { return r.duration, true })
+		node, snap, func(r mountResult) (float64, bool) { return r.duration, true })
 
 	gauge(w, "xfs_freesp_scrape_success",
 		"1 if the last GETFSMAP walk succeeded, else 0.",
-		snap, func(r mountResult) (float64, bool) { return b2f(r.success), true })
+		node, snap, func(r mountResult) (float64, bool) { return b2f(r.success), true })
 }
 
 // gauge writes one gauge metric family: the HELP/TYPE header plus one sample per
 // mount for which val reports ok.
-func gauge(w io.Writer, name, help string, snap []mountResult, val func(mountResult) (float64, bool)) {
+func gauge(w io.Writer, name, help, node string, snap []mountResult, val func(mountResult) (float64, bool)) {
 	fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n", name, help, name)
 	for _, r := range snap {
 		v, ok := val(r)
 		if !ok {
 			continue
 		}
-		fmt.Fprintf(w, "%s{mountpoint=\"%s\",device=\"%s\"} %s\n",
-			name, escapeLabel(r.mount.mountpoint), escapeLabel(r.mount.device), formatFloat(v))
+		fmt.Fprintf(w, "%s{%s} %s\n", name, r.labels(node), formatFloat(v))
 	}
+}
+
+// labels renders the Prometheus label set shared by every series.
+func (r mountResult) labels(node string) string {
+	return fmt.Sprintf(`node="%s",mountpoint="%s",device="%s"`,
+		escapeLabel(node), escapeLabel(r.mount.mountpoint), escapeLabel(r.mount.device))
 }
 
 // escapeLabel escapes a Prometheus label value: backslash, double-quote, newline.

@@ -97,7 +97,9 @@ mount, aggregates the free-extent geometry, and serves Prometheus metrics.
 
 ## 3. Metrics
 
-Every series labelled `mountpoint` and `device`. Emitted per discovered XFS mount.
+Every series labelled `node`, `mountpoint` and `device` (`node` from the
+downward-API `NODE_NAME`, so the sick node is identifiable). Emitted per
+discovered XFS mount.
 
 ### MVP — the sick-node signal (all from one GETFSMAP walk)
 
