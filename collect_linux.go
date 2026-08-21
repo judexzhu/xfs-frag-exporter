@@ -5,6 +5,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"syscall"
@@ -60,16 +61,20 @@ func collectFreeExtents(path string) ([]uint64, error) {
 	head := (*fsmapHead)(unsafe.Pointer(&buf[0]))
 	recs := unsafe.Slice((*fsmap)(unsafe.Pointer(&buf[headSize])), recsPerCall)
 
-	// High key: match everything up to the end of every device.
+	// High key: match everything up to the end of every device. Do NOT set
+	// fmr_flags here — the kernel validates key flags against FMR_OF_ALL.
 	head.Keys[1] = fsmap{
 		Device:   ^uint32(0),
-		Flags:    ^uint32(0),
 		Physical: ^uint64(0),
 		Owner:    ^uint64(0),
 		Offset:   ^uint64(0),
 	}
 
+	debug := os.Getenv("DEBUG_GETFSMAP") != ""
 	var out []uint64
+	var raw uint64
+	var sampleFlags uint32
+	var sampleOwner uint64
 	for {
 		head.Count = recsPerCall
 		head.Entries = 0
@@ -83,6 +88,10 @@ func collectFreeExtents(path string) ([]uint64, error) {
 		}
 		for i := 0; i < n; i++ {
 			r := recs[i]
+			if raw == 0 {
+				sampleFlags, sampleOwner = r.Flags, r.Owner
+			}
+			raw++
 			if r.Flags&fmrOfSpecialOwner != 0 && r.Owner == fmrOwnFree {
 				out = append(out, r.Length)
 			}
@@ -92,6 +101,9 @@ func collectFreeExtents(path string) ([]uint64, error) {
 			break
 		}
 		head.Keys[0] = last // continue after the last record
+	}
+	if debug {
+		log.Printf("GETFSMAP %s: raw=%d free=%d sampleFlags=%#x sampleOwner=%#x", path, raw, len(out), sampleFlags, sampleOwner)
 	}
 	return out, nil
 }
