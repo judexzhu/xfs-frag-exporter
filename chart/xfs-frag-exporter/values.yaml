@@ -1,0 +1,54 @@
+# Target namespace. hostPath requires the 'privileged' Pod Security level, so
+# the chart labels the namespace accordingly when it creates it.
+namespace: xfs-frag-exporter
+namespaceCreate: true
+
+image:
+  repository: ghcr.io/judexzhu/xfs-frag-exporter
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Collection tuning.
+listenPort: 9101
+hostRoot: /host
+scrapeInterval: 300s # GETFSMAP walk cost scales with fragmentation
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 64Mi
+
+# Least-privilege by default: GETFSMAP free-space reads need no privileged/caps.
+# If a cluster's SELinux/permissions block opening host mounts, set
+# privileged: true below (overrides securityContext).
+privileged: false
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+nodeSelector:
+  kubernetes.io/os: linux
+
+tolerations:
+  - operator: Exists # run on every node, including tainted ones
+
+# Prometheus Operator integration (kube-prometheus / OpenShift UWM). Off by
+# default — without it, scrape via the pod's prometheus.io annotations.
+serviceMonitor:
+  enabled: false
+  interval: 300s
+
+# Alert rules. Thresholds are HEURISTIC — calibrate against your fleet.
+prometheusRule:
+  enabled: false
+  fragRatePerDay: "1.05" # >3x the ~0.35/day aging baseline
+  maxExtentRatio: "0.10" # MAX_EXT as a fraction of an allocation group
+  agsizeBytes: "1434976256" # fleet constant (350336 blks x 4096); replace per-fleet

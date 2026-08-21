@@ -65,6 +65,27 @@ oc -n xfs-frag-exporter rollout status ds/xfs-frag-exporter
 oc -n xfs-frag-exporter exec ds/xfs-frag-exporter -- wget -qO- localhost:9101/metrics
 ```
 
+## Deploy with Helm
+
+```sh
+helm install xfs-frag-exporter ./chart/xfs-frag-exporter
+```
+
+The chart creates the `xfs-frag-exporter` namespace (with the required privileged
+Pod Security labels), a ServiceAccount, a DaemonSet, and a headless Service.
+Common overrides:
+
+```sh
+# Prometheus Operator integration (ServiceMonitor + alert rules)
+helm install xfs-frag-exporter ./chart/xfs-frag-exporter \
+  --set serviceMonitor.enabled=true --set prometheusRule.enabled=true
+
+# fall back to a privileged container if SELinux/permissions block host reads
+helm install xfs-frag-exporter ./chart/xfs-frag-exporter --set privileged=true
+```
+
+All knobs are in [`chart/xfs-frag-exporter/values.yaml`](./chart/xfs-frag-exporter/values.yaml).
+
 ## Scraping
 
 - **No Prometheus Operator / no UWM:** the pods carry `prometheus.io/scrape`

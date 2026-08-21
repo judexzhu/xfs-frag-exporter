@@ -1,0 +1,15 @@
+{{- if .Values.namespaceCreate }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespace }}
+  labels:
+    {{- include "xfs-frag-exporter.labels" . | nindent 4 }}
+    # hostPath requires the 'privileged' Pod Security level even though the
+    # container runs unprivileged/non-root.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+    # OpenShift only: keep the SCC controller from reverting the labels above.
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+{{- end }}

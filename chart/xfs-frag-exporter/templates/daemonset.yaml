@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "xfs-frag-exporter.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "xfs-frag-exporter.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "xfs-frag-exporter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "xfs-frag-exporter.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.listenPort | quote }}
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: {{ include "xfs-frag-exporter.name" . }}
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      containers:
+        - name: exporter
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.listenPort }}
+          env:
+            - name: NODE_NAME # labels every series so you can tell which node is sick
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HOST_ROOT
+              value: {{ .Values.hostRoot | quote }}
+            - name: SCRAPE_INTERVAL
+              value: {{ .Values.scrapeInterval | quote }}
+            - name: LISTEN_ADDR
+              value: ":{{ .Values.listenPort }}"
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            {{- if .Values.privileged }}
+            privileged: true
+            {{- else }}
+            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: host
+              mountPath: {{ .Values.hostRoot }}
+              readOnly: true
+              mountPropagation: HostToContainer
+          livenessProbe:
+            httpGet:
+              path: /
+              port: {{ .Values.listenPort }}
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: {{ .Values.listenPort }}
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+            type: Directory

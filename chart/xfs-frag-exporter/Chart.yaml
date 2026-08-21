@@ -1,0 +1,14 @@
+apiVersion: v2
+name: xfs-frag-exporter
+description: XFS free-space fragmentation exporter (native GETFSMAP) for Kubernetes/OpenShift
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/judexzhu/xfs-frag-exporter
+sources:
+  - https://github.com/judexzhu/xfs-frag-exporter
+keywords:
+  - xfs
+  - fragmentation
+  - prometheus
+  - exporter

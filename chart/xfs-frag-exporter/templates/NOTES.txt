@@ -1,0 +1,19 @@
+xfs-frag-exporter installed into namespace {{ .Values.namespace }}.
+
+Check it:
+  kubectl -n {{ .Values.namespace }} rollout status ds/{{ include "xfs-frag-exporter.name" . }}
+  kubectl -n {{ .Values.namespace }} exec ds/{{ include "xfs-frag-exporter.name" . }} -- wget -qO- localhost:{{ .Values.listenPort }}/metrics
+
+Rank the fleet's fragmenting ("sick") nodes:
+  topk(10, deriv(xfs_frag_density_extents_per_gib[24h]) * 86400)
+
+{{- if not .Values.serviceMonitor.enabled }}
+
+No ServiceMonitor created. Either scrape via the pod prometheus.io annotations,
+or re-install with --set serviceMonitor.enabled=true (needs Prometheus Operator).
+{{- end }}
+{{- if .Values.privileged }}
+
+WARNING: running privileged. Least-privilege (privileged=false) is preferred;
+only keep this if SELinux/permissions block host reads.
+{{- end }}

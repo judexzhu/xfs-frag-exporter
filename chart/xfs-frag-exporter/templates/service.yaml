@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "xfs-frag-exporter.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "xfs-frag-exporter.labels" . | nindent 4 }}
+spec:
+  clusterIP: None # headless: one target per node pod
+  selector:
+    {{- include "xfs-frag-exporter.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.listenPort }}
+      targetPort: metrics

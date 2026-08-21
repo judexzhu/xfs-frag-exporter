@@ -1,0 +1,50 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "xfs-frag-exporter.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "xfs-frag-exporter.labels" . | nindent 4 }}
+    role: alert-rules
+spec:
+  groups:
+    - name: xfs-frag.rules
+      rules:
+        - record: node:xfs_frag_density:rate1d
+          expr: deriv(xfs_frag_density_extents_per_gib[24h]) * 86400
+    - name: xfs-frag.alerts
+      rules:
+        # SICK (early): fragmenting abnormally fast for its age.
+        - alert: XFSFragmentationRising
+          expr: node:xfs_frag_density:rate1d > {{ .Values.prometheusRule.fragRatePerDay }}
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: {{ `"XFS fragmenting fast on {{ $labels.node }} {{ $labels.mountpoint }}"` }}
+            description: {{ `"frag_density rising {{ $value | printf \"%.2f\" }} extents/GiB/day for 2h."` }}
+        # APPROACHING DEAD: largest free extent collapsing vs the AG ceiling.
+        - alert: XFSLowContiguity
+          expr: xfs_free_extent_max_bytes / {{ .Values.prometheusRule.agsizeBytes }} < {{ .Values.prometheusRule.maxExtentRatio }}
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: {{ `"XFS largest free extent low on {{ $labels.node }} {{ $labels.mountpoint }}"` }}
+        # REAL DANGER: sparse inodes off (phase-1.5 metric; harmless until then).
+        - alert: XFSSparseInodesDisabled
+          expr: xfs_sparse_inodes_enabled == 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: {{ `"XFS sparse inodes disabled on {{ $labels.node }} {{ $labels.mountpoint }}"` }}
+        - alert: XFSExporterStale
+          expr: xfs_freesp_scrape_success == 0
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: {{ `"XFS frag exporter scrape failing on {{ $labels.node }} {{ $labels.mountpoint }}"` }}
+{{- end }}
