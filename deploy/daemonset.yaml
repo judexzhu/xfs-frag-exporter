@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: xfs-frag-exporter
+  namespace: xfs-frag-exporter
+  labels:
+    app: xfs-frag-exporter
+spec:
+  selector:
+    matchLabels:
+      app: xfs-frag-exporter
+  template:
+    metadata:
+      labels:
+        app: xfs-frag-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9101"
+        prometheus.io/path: /metrics
+    spec:
+      serviceAccountName: xfs-frag-exporter
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists # run on every node, including tainted ones
+      containers:
+        - name: exporter
+          # CHANGEME: push to your registry (e.g. quay.io/<you>/xfs-frag-exporter).
+          image: quay.io/CHANGEME/xfs-frag-exporter:latest
+          ports:
+            - name: metrics
+              containerPort: 9101
+          env:
+            - name: HOST_ROOT
+              value: /host
+            - name: SCRAPE_INTERVAL
+              value: "300s"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+          # Least-privilege: no privileged, no added capabilities, non-root, RO
+          # root fs. GETFSMAP needs none of them for free space. If a node's
+          # SELinux/permissions block opening the host mount, see README ("If
+          # least-privilege fails").
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: host
+              mountPath: /host
+              readOnly: true
+              mountPropagation: HostToContainer
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 9101
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9101
+      volumes:
+        - name: host
+          hostPath:
+            path: /
+            type: Directory

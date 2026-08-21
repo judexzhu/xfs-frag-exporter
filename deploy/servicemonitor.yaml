@@ -1,0 +1,18 @@
+# Optional — only for clusters running the Prometheus Operator (e.g. OpenShift
+# User Workload Monitoring). Without it, scrape via the pod annotations in
+# daemonset.yaml or a static Prometheus config. See README.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: xfs-frag-exporter
+  namespace: xfs-frag-exporter
+  labels:
+    app: xfs-frag-exporter
+spec:
+  selector:
+    matchLabels:
+      app: xfs-frag-exporter
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 300s # match the collection interval; faster only stair-steps

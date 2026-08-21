@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: xfs-frag-exporter
+  namespace: xfs-frag-exporter
+  labels:
+    app: xfs-frag-exporter
+spec:
+  clusterIP: None # headless: one target per node pod
+  selector:
+    app: xfs-frag-exporter
+  ports:
+    - name: metrics
+      port: 9101
+      targetPort: metrics

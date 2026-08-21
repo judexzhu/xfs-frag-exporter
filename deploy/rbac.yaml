@@ -1,0 +1,7 @@
+# The exporter does not call the Kubernetes API — it only needs an identity to
+# run as. No Role/ClusterRole is required.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: xfs-frag-exporter
+  namespace: xfs-frag-exporter

@@ -1,0 +1,75 @@
+# XFS fragmentation alerts. See docs/adr/0001 and SPEC §5.
+#
+# THRESHOLDS ARE HEURISTIC DEFAULTS, NOT FLEET-CALIBRATED. Tune them:
+#   - 1.05/day = 3x the ~0.35 extents/GiB/day aging baseline, itself only 3
+#     cross-sectional data points. Set from your own observed distribution.
+#   - 0.10 = MAX_EXT as a fraction of an allocation group; healthy ~0.99.
+#   - agsize (1434976256 B = 350336 blks x 4096) is hardcoded as a homogeneous-
+#     fleet constant. Replace with the xfs_agsize_bytes metric once FSGEOMETRY
+#     collection ships (phase 1.5).
+#
+# XFSFragmentationRising needs ~26h of history (deriv[24h] + for:2h) before it
+# can fire.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: xfs-frag-exporter
+  labels:
+    role: alert-rules
+spec:
+  groups:
+    - name: xfs-frag.rules
+      rules:
+        # The sick-node signal: rate of fragmentation growth, per day.
+        - record: node:xfs_frag_density:rate1d
+          expr: deriv(xfs_frag_density_extents_per_gib[24h]) * 86400
+
+    - name: xfs-frag.alerts
+      rules:
+        # SICK (early): fragmenting abnormally fast for its age.
+        - alert: XFSFragmentationRising
+          expr: node:xfs_frag_density:rate1d > 1.05
+          for: 2h
+          labels:
+            severity: warning
+          annotations:
+            summary: "XFS fragmenting fast on {{ $labels.node }} {{ $labels.mountpoint }}"
+            description: >-
+              frag_density rising {{ $value | printf "%.2f" }} extents/GiB/day
+              (>3x the ~0.35/day aging baseline) for 2h. Rank the fleet with
+              topk(10, node:xfs_frag_density:rate1d).
+
+        # APPROACHING DEAD: largest free extent collapsing vs the AG ceiling.
+        - alert: XFSLowContiguity
+          expr: xfs_free_extent_max_bytes / 1434976256 < 0.10
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "XFS largest free extent < 10% of AG on {{ $labels.node }} {{ $labels.mountpoint }}"
+            description: >-
+              MAX_EXT is {{ $value | printf "%.2f" }} of agsize (healthy ~0.99);
+              contiguity is collapsing.
+
+        # REAL DANGER: sparse inodes off re-opens the classic ENOSPC path.
+        # Requires the phase-1.5 FSGEOMETRY metric; harmless (never fires) until then.
+        - alert: XFSSparseInodesDisabled
+          expr: xfs_sparse_inodes_enabled == 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "XFS sparse inodes DISABLED on {{ $labels.node }} {{ $labels.mountpoint }}"
+            description: >-
+              sparse=0: free-space fragmentation can cause creat() ENOSPC.
+              Unexpected on RHEL9/RHCOS.
+
+        # Collection health.
+        - alert: XFSExporterStale
+          expr: xfs_freesp_scrape_success == 0
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: "XFS frag exporter scrape failing on {{ $labels.node }} {{ $labels.mountpoint }}"
+            description: "No successful GETFSMAP walk for 30m."
