@@ -37,12 +37,17 @@ are heuristic; calibrate them against your fleet.**
 
 ## Build & push
 
+CI builds and pushes on every push to `main`: `.github/workflows/build.yml`
+produces a multi-arch image at `ghcr.io/judexzhu/xfs-frag-exporter:latest`.
+**One-time:** make the GHCR package public so nodes can pull without a secret
+(repo → Packages → package → visibility).
+
+Manual build:
+
 ```sh
-REG=quay.io/<you>/xfs-frag-exporter
+REG=ghcr.io/judexzhu/xfs-frag-exporter
 docker buildx build --platform linux/amd64,linux/arm64 -t $REG:latest --push .
 ```
-
-Then set `image:` in `deploy/daemonset.yaml` to `$REG:latest`.
 
 ## Deploy
 

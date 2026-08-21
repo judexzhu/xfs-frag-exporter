@@ -25,8 +25,9 @@ spec:
         - operator: Exists # run on every node, including tainted ones
       containers:
         - name: exporter
-          # CHANGEME: push to your registry (e.g. quay.io/<you>/xfs-frag-exporter).
-          image: quay.io/CHANGEME/xfs-frag-exporter:latest
+          # Built + pushed by .github/workflows/build.yml. Make the GHCR package
+          # public once so nodes can pull without an image pull secret.
+          image: ghcr.io/judexzhu/xfs-frag-exporter:latest
           ports:
             - name: metrics
               containerPort: 9101
