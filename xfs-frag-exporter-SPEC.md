@@ -4,12 +4,18 @@
 > and a real-node measurement. v1's evidence (the 3-node table) is retained; its
 > conclusions, failure premise, collection mechanism, and alert design are
 > revised. See `docs/adr/0001` and `docs/adr/0002` for the load-bearing decisions.
+>
+> **Field-evidence update (RHEL-82924, RFE-9762):** internal Red Hat incident data
+> and a new exported metric overturn two v2 conclusions — `sparse=1` does **not**
+> prevent fragmentation ENOSPC (it only mitigates), and the **level** of average
+> free-extent size (not the *rate*) is the reliable sick-node signal. Corrections
+> are inline below; see `docs/adr/0003`.
 
 ## 0. What changed from v1, and why
 
 | v1 claim | Verdict | Correction |
 |---|---|---|
-| ENOSPC-despite-free-space from free-space fragmentation is the target failure | **Overstated for RHEL 9 / RHCOS** | `sparse=1` is the default on every ROSA node (confirmed by `xfs_info /var`). Sparse inodes drop the inode-chunk floor from 8 contiguous blocks to a single 4 KiB block, so the fragmentation-driven inode-ENOSPC path is designed out. Red Hat KCS 7110315: "no indication of this issue happening in RHEL 9." **Reframe the tool from *predict ENOSPC* to *identify fragmented/degrading nodes* (observability).** |
+| ENOSPC-despite-free-space from free-space fragmentation is the target failure | **Confirmed — but not via inode exhaustion (RHEL-82924)** | `sparse=1` is the default on every ROSA node (confirmed by `xfs_info /var`) and lowers the contiguous run inode allocation needs (a full 64-inode chunk → a smaller sparse cluster), but it **does not eliminate** fragmentation ENOSPC: under severe free-space fragmentation allocation still fails, and Red Hat kernel tracking **RHEL-82924** confirms it on `sparse=1` ROSA HCP nodes. `df -i` stays healthy — the root cause is free-space fragmentation, not inode exhaustion. The tool *identifies fragmented/degrading nodes* (observability) **and** flags that ENOSPC risk. |
 | `privileged: true` + `CAP_SYS_ADMIN` required | **Refuted** | `XFS_IOC_GETFSMAP` has no capability gate for free space; unprivileged callers walk the free-space btree (`bnobt`). Your nodes have `rmapbt=0`, so the privileged rmap path isn't even available. Free-space reads need **no `CAP_SYS_ADMIN`, no `privileged`** — only a hostPath mount. |
 | chroot to host `xfs_spaceman -c 'freesp -s'` | **Wrong call** | `freesp` is just GETFSMAP + userspace bucketing, and it never even outputs the largest extent. Issue GETFSMAP **natively from Go**. Static binary depends only on the stable-since-4.12 kernel ABI — no chroot, no host binary/libs, no version-mismatch. |
 | `baseline_ratio` recording rule (`0.35 × uptime`) | **Broken twice** | `0.35` is fit to 3 nodes; and it divides by node **uptime**, which resets on reboot while filesystem age does not. Dropped entirely. |
@@ -18,21 +24,30 @@
 
 Research sources: Red Hat KCS 7110315; `mkfs.xfs(8)` (sparse default since xfsprogs 4.16);
 kernel `fs/xfs/xfs_fsmap.c` (no cap gate); `ioctl_getfsmap(2)` (ABI since 4.12);
-AWS EKS NMA docs (`XFSSmallAverageClusterSize` = Event, repair None).
+AWS EKS NMA docs (`XFSSmallAverageClusterSize` = avg free extent < 16 blocks).
+
+Field-evidence sources: Red Hat kernel tracking **RHEL-82924** (fragmentation
+ENOSPC confirmed on `sparse=1`, expected XFS behaviour, not a bug); kernel tracing
+(**Fluent Bit / fluentd** filesystem buffer drives ~42× the XFS extent allocations
+of any other process — the confirmed trigger; high-log-volume pods accelerate it,
+risk grows with node age); Jira **RFE-9762** (expose the detection metric via
+OpenShift Monitoring and enable node remediation — this exporter implements it).
 
 ## 1. The need
 
 Under container churn, an XFS filesystem's free space fragments: the same free
 bytes get split across more and smaller extents over time. On modern RHCOS
-(`sparse=1`) this no longer causes the classic `creat()`-ENOSPC failure, but it
-is still a real signal of a **degrading node** — the allocator works harder,
-large-contiguous allocations get scarcer, and it is a leading indicator that
+(`sparse=1`) this still causes ENOSPC while `df` shows free GiB once the average
+free extent falls below ~16 blocks (64 KiB) — `sparse=1` mitigates but does not
+prevent it (RHEL-82924) — and it is also a real signal of a **degrading node**:
+the allocator works harder, large-contiguous allocations get scarcer, and it
 tracks node age and workload churn. The kernel exposes the free-extent **size
 distribution** only via `XFS_IOC_GETFSMAP` (no `/proc` or `/sys` equivalent), so
 nothing in `node_exporter`, kubelet, or `DiskPressure` can see it today.
 
 **Goal: give operators a per-node, per-mount fragmentation signal to rank and
-identify "sick" nodes** — not to predict ENOSPC (which `sparse=1` prevents).
+identify "sick" nodes** — and to flag the free-space-fragmentation ENOSPC risk
+(avg free extent < 64 KiB) that `sparse=1` mitigates but does not prevent.
 
 ### Evidence (v1, retained — real measurements, 4K bsize)
 
@@ -50,9 +65,9 @@ information, identical node ranking. Choosing density over avg buys intuitivenes
 (higher = worse, per-GiB-free), **not** a removed confound. (v1 claimed density
 cancels a utilisation confound that avg has — mathematically false; corrected.)
 
-**(b) The real flaw is alerting on an absolute *level*.** Any static threshold on
-density (or avg) fires on old-but-normal nodes, because the level scales with age
-— density ÷ age holds ~0.31–0.43 across a 10× age range:
+**(b) The *level* is the signal — a validated floor, not the rate.** The 3-node
+sample shows density scaling with age (density ÷ age holds ~0.31–0.43 across a 10×
+age range), which is why v2 reached for a rate:
 
 | Node | density | density ÷ age |
 |---|---|---|
@@ -60,13 +75,16 @@ density (or avg) fires on old-but-normal nodes, because the level scales with ag
 | C | 3.56 | 0.43 |
 | B | 11.94 | 0.31 |
 
-So the discriminator for a *sick* (not merely old) node is the **rate of change**
-of density, not its level — this is also the true flaw in EKS NMA's
-`XFSSmallAverageClusterSize` (it alarms on an absolute average). Aging baseline
-≈ 0.35 extents/GiB/day, but that is **3 cross-sectional points (different nodes,
-not one node over time) — do NOT treat 0.35 or any derived threshold as
-validated.** Prometheus `deriv` of the density gauge is the defensible signal;
-thresholds need fleet calibration.
+But field evidence (RHEL-82924) fixes an absolute floor the aging trend never
+reaches on a healthy node: the **average free-extent size below 16 blocks (64 KiB)**
+— equivalently **density above ~16384 extents/GiB** (they are exact reciprocals) —
+is the reliable sick-node signal, and it is exactly what EKS NMA's
+`XFSSmallAverageClusterSize` alerts on. This *confirms* the EKS threshold, contrary
+to v2's claim that its absolute average was a flaw. The `deriv` rate is demoted to a
+**weak, informational secondary**: rate-based PromQL false-positives across
+production clusters (a pending alert fired on a 6-hour-old node). The ≈0.35/day
+aging baseline is **3 cross-sectional points — not validated** — and is no longer
+load-bearing.
 
 **(c) MAX_EXT is ceilinged at agsize.** A free extent cannot span an allocation
 group. The measured node has `agsize=350336 blks` (~1.33 GiB); all three nodes
@@ -105,7 +123,8 @@ discovered XFS mount.
 
 | Metric | Type | Note |
 |---|---|---|
-| `xfs_frag_density_extents_per_gib` | gauge | **primary.** `free_extents / (free_bytes / 2^30)`. Fixture → 1.2557 |
+| `xfs_free_extent_avg_bytes` | gauge | **primary.** `free_bytes / free_extents`; **critical < 64 KiB (16 blocks)** — fragmentation ENOSPC risk (RHEL-82924); matches EKS `XFSSmallAverageClusterSize`. Fixture → 855,116,714 (~815 MiB, healthy) |
+| `xfs_frag_density_extents_per_gib` | gauge | **primary.** `free_extents / (free_bytes / 2^30)`; exact reciprocal of avg (critical > ~16384). Fixture → 1.2557 |
 | `xfs_free_extent_max_bytes` | gauge | **primary.** largest contiguous free extent. Interpret vs agsize. Fixture → 1,426,587,648 (348,288 blk) |
 | `xfs_free_extents` | gauge | count of free extents |
 | `xfs_free_bytes` | gauge | Σ free-extent bytes (density denominator; cross-check vs `statfs`) |
@@ -117,7 +136,6 @@ discovered XFS mount.
 | Metric | Source | Note |
 |---|---|---|
 | `xfs_free_extent_size_bytes_bucket{le}` | GETFSMAP | cumulative count ≤ size (le = 4Ki, 64Ki, 1Mi, 32Mi, 1Gi, +Inf); shows distribution drift |
-| `xfs_avg_free_extent_bytes` | GETFSMAP | EKS-NMA-equivalent; **HELP text documents the confound** |
 | `xfs_size_bytes` / `xfs_avail_bytes` | statfs | capacity context |
 | `xfs_inodes_used` / `xfs_inodes_total` | statfs | catch imaxpct exhaustion (a distinct real failure) |
 | `xfs_agsize_bytes` / `xfs_agcount` / `xfs_block_size_bytes` | FSGEOMETRY | normalise MAX_EXT against agsize; may need `CAP_SYS_ADMIN` (verify) |
@@ -158,21 +176,31 @@ discovered XFS mount.
 
 ## 5. Rules & alerts (deferred — separate PrometheusRule file, not the binary)
 
-Given `sparse=1`, alert only on states that genuinely gate failure. **Baked as
-`deploy/prometheusrule.yaml`** (thresholds are heuristic defaults — calibrate):
+The primary alert is the field-validated avg-extent floor; the rest cover
+contiguity, config, and collection health. **Baked as `deploy/prometheusrule.yaml`**
+(thresholds are heuristic defaults — calibrate):
 
 | Alert | Expression | Severity | Meaning |
 |---|---|---|---|
-| `XFSFragmentationRising` | `node:xfs_frag_density:rate1d > 1.05` for 2h | warning | **sick (early):** fragmenting >3× the ~0.35/day aging baseline |
+| `XFSSmallAverageExtent` | `xfs_free_extent_avg_bytes < 65536` for 30m | warning | **primary:** avg free extent < 16 blocks (64 KiB) — fragmentation ENOSPC risk (RHEL-82924); matches EKS `XFSSmallAverageClusterSize` |
 | `XFSLowContiguity` | `xfs_free_extent_max_bytes / agsize_bytes < 0.10` for 30m | warning | **approaching dead:** largest free extent collapsing vs AG ceiling |
-| `XFSSparseInodesDisabled` | `xfs_sparse_inodes_enabled == 0` for 1h | warning | real danger — re-opens ENOSPC path (phase 1.5 metric) |
+| `XFSFragmentationRising` | `node:xfs_frag_density:rate1d > 1.05` for 2h | info | weak secondary — rate is false-positive prone; prefer the level |
+| `XFSSparseInodesDisabled` | `xfs_sparse_inodes_enabled == 0` for 1h | warning | sparse=0 aggravates fragmentation ENOSPC (sparse=1 mitigates, not immunity) (phase 1.5 metric) |
 | `XFSExporterStale` | `xfs_freesp_scrape_success == 0` for 30m | info | collection failing |
 
-Recording rule: `node:xfs_frag_density:rate1d = deriv(xfs_frag_density_extents_per_gib[24h]) * 86400`.
-`1.05 = 3 × 0.35` is a *rate* multiplier (defensible even though the absolute 0.35
-is 3 points); `0.10` and `agsize` (fleet constant `1,434,976,256 B` = 350336×4096
-until the FSGEOMETRY metric ships) are heuristic. **None are fleet-calibrated.**
-Peer-relative snapshot alternative (no history): `topk(10, xfs_frag_density_extents_per_gib)`.
+Recording rule (secondary): `node:xfs_frag_density:rate1d = deriv(xfs_frag_density_extents_per_gib[24h]) * 86400`.
+The `1.05 = 3 × 0.35` rate threshold is **informational only** — rate-based PromQL
+false-positives across production clusters (a pending alert fired on a 6-hour-old
+node). The primary `65536` floor (16 blocks) is field-validated; `0.10` and `agsize`
+(fleet constant `1,434,976,256 B` = 350336×4096 until the FSGEOMETRY metric ships)
+are heuristic. Peer-relative snapshot alternative (no history):
+`topk(10, xfs_frag_density_extents_per_gib)`.
+
+**Remediation is node replacement** (`xfs_fsr` needs an unmount — impossible on a
+live root fs): cordon → drain → delete the machine (ROSA HCP via NodePool scaling,
+ROSA Classic via MachineSet). Preventively reduce the fragmentation *rate* — switch
+Fluent Bit to memory buffering where log loss is tolerable, or cap
+`storage.max_chunks_up` / `storage.total_limit_size`, and rotate long-lived nodes.
 
 ## 6. Acceptance criteria
 
@@ -216,8 +244,9 @@ as **separate optional files** for Prometheus-Operator users.
 
 ## 8. Out of scope / non-goals
 
-- Predicting ENOSPC (prevented by `sparse=1`) — this tool observes, it does not
-  predict a failure that no longer occurs.
+- Predicting the exact ENOSPC failure moment — this tool exposes the risk signal
+  (avg free extent < 64 KiB, RHEL-82924) and ranks degrading nodes; it does not
+  forecast when a given node will hit ENOSPC.
 - Remediation / node draining — autoRepair can't act on custom conditions; node
   replacement is a human decision.
 - `xfs_fsr` — defragments *files*, not free space; can worsen free-space frag.

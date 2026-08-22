@@ -17,15 +17,24 @@ tests, and code. No implementation detail here — see the SPEC and ADRs for tha
 - **Free extent** — one contiguous run of free blocks, as reported by
   `GETFSMAP` (`fmr_owner == FMR_OWN_FREE`). Lengths are in bytes.
 
+- **Average free extent size** (`xfs_free_extent_avg_bytes`) — `free_bytes /
+  free_extents`, the mean contiguous free run. **The primary, field-validated
+  sick-node signal**: **critical below 16 blocks (64 KiB)**, where XFS can return
+  ENOSPC despite free space (`df` and `df -i` both healthy — free-space
+  fragmentation, not inode exhaustion; RHEL-82924). Matches AWS EKS's
+  `XFSSmallAverageClusterSize`. The exact reciprocal of `frag density` (see
+  [[ADR-0003]]).
+
 - **frag density** (`frag_density`) — `free_extents / free_GiB`. For a fixed block
   size this is the exact reciprocal of average free extent size (`262144 /
   avg_blocks` at 4K) — same information, chosen for intuitiveness (higher = worse),
-  not because it removes a confound. It scales with node age, so the **rate of
-  change** of density — not its level — is what identifies a sick node.
+  not because it removes a confound. Its **level** is the reliable signal (critical
+  above ~16384 extents/GiB, the reciprocal of the 64 KiB avg-extent floor); see
+  [[ADR-0003]].
 
-- **frag rate** — `deriv(frag_density[24h]) × 86400`, extents/GiB/day. The actual
-  sick-node discriminator: a node fragmenting abnormally fast *for its age*.
-  Aging baseline ≈ 0.35/day (3 nodes; heuristic, not calibrated).
+- **frag rate** — `deriv(frag_density[24h]) × 86400`, extents/GiB/day. A **weak,
+  informational secondary** only: rate-based alerting is false-positive prone (a
+  pending alert fired on a 6-hour-old node). Use the *level*, not the rate.
 
 - **MAX_EXT** — the single largest free extent (`xfs_free_extent_max_bytes`).
   Gates large contiguous allocation. **Ceilinged at `agsize`** (a free extent
@@ -36,9 +45,11 @@ tests, and code. No implementation detail here — see the SPEC and ADRs for tha
   `agsize` is the blocks per AG and the hard ceiling on any single free extent.
 
 - **Sparse inodes** (`sparse=1`) — XFS feature (default on RHEL 9 / RHCOS) that
-  lets inode chunks be allocated from as little as a single block, removing the
-  8-contiguous-block requirement. Its presence is why the classic ENOSPC failure
-  no longer occurs on the target fleet (see [[ADR-0001]]).
+  lets inode chunks be allocated from as little as a single block, lowering the
+  contiguous run inode allocation needs (a full 64-inode chunk → a smaller sparse
+  cluster). It **mitigates but does not eliminate** fragmentation ENOSPC: under
+  severe free-space fragmentation allocation still fails, and RHEL-82924 is
+  confirmed on `sparse=1` ROSA HCP nodes. `sparse=0` aggravates it further.
 
 - **GETFSMAP** — `XFS_IOC_GETFSMAP`, the only live kernel interface exposing the
   free-extent size distribution. Issued natively (see [[ADR-0002]]); needs no

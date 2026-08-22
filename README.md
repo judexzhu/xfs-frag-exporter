@@ -15,25 +15,41 @@ Per XFS mount (labelled `node` + `mountpoint` + `device`) it exposes:
 
 | Metric | Meaning |
 |---|---|
-| `xfs_frag_density_extents_per_gib` | free extents ÷ free GiB — the fragmentation signal |
+| `xfs_free_extent_avg_bytes` | mean contiguous free extent — the fragmentation signal; ENOSPC-with-free-space risk when < 64 KiB |
+| `xfs_frag_density_extents_per_gib` | free extents ÷ free GiB — reciprocal of avg extent size (same signal) |
 | `xfs_free_extent_max_bytes` | largest contiguous free extent (ceilinged at agsize) |
 | `xfs_free_extents` | number of free extents |
 | `xfs_free_bytes` | total free space |
 | `xfs_freesp_scrape_duration_seconds` | cost of the GETFSMAP walk |
 | `xfs_freesp_scrape_success` | 1 if the last walk succeeded |
 
-**Identifying a sick node:** fragmentation density scales with node age, so its
-*level* is not enough. The discriminator is the **rate of change**:
+**Identifying a sick node:** the primary, field-validated signal is the **average
+free-extent size** falling below **16 blocks (64 KiB)** — equivalently frag
+density rising above **~16384 extents/GiB** (the two are exact reciprocals). This
+is the same quantity AWS EKS's Node Monitoring Agent alerts on, named
+`XFSSmallAverageClusterSize`. Below this floor XFS can return ENOSPC while `df`
+still shows free GiB (Red Hat kernel tracking **RHEL-82924**); `df -i` looks
+healthy — it is free-space fragmentation, not inode exhaustion.
 
 ```promql
-# rank nodes fragmenting fastest (extents/GiB/day)
+# nodes at or past the 64 KiB critical floor
+xfs_free_extent_avg_bytes < 65536
+
+# rank the worst mounts by level
+topk(10, xfs_frag_density_extents_per_gib)
+```
+
+A `deriv()` rate query exists but is a **weak, informational secondary** — it is
+false-positive prone (a rising slope over partial history flagged a 6-hour-old
+node), so trust the *level* above, not the rate:
+
+```promql
+# informational only — noisy on young nodes
 topk(10, deriv(xfs_frag_density_extents_per_gib[24h]) * 86400)
 ```
 
-A node rising faster than ~3× the ~0.35/day aging baseline is fragmenting
-abnormally for its age. Alert rules are in
-[`deploy/prometheusrule.yaml`](./deploy/prometheusrule.yaml) — **thresholds there
-are heuristic; calibrate them against your fleet.**
+Alert rules are in [`deploy/prometheusrule.yaml`](./deploy/prometheusrule.yaml) —
+**thresholds there are heuristic; calibrate them against your fleet.**
 
 ## Build & push
 
@@ -113,17 +129,37 @@ the platform `prometheus-k8s` **evaluates** the `PrometheusRule` too (same
 
 | Alert | Fires on | Meaning |
 |---|---|---|
-| `XFSFragmentationRising` | `node:xfs_frag_density:rate1d > 1.05` for 2h | fragmenting >3× the ~0.35/day aging baseline — a sick node |
+| `XFSSmallAverageExtent` | `xfs_free_extent_avg_bytes < 65536` for 30m | **primary:** avg free extent below 16 blocks (64 KiB) — ENOSPC-with-free-space risk (RHEL-82924); matches EKS `XFSSmallAverageClusterSize` |
 | `XFSLowContiguity` | `max_extent / agsize < 0.10` for 30m | largest free extent collapsing — approaching dead |
-| `XFSSparseInodesDisabled` | `xfs_sparse_inodes_enabled == 0` | re-opens the ENOSPC path (phase-1.5 metric; never fires until then) |
+| `XFSFragmentationRising` | `node:xfs_frag_density:rate1d > 1.05` for 2h | info / weak secondary — rate is false-positive prone; prefer the level above |
+| `XFSSparseInodesDisabled` | `xfs_sparse_inodes_enabled == 0` | sparse=0 aggravates fragmentation ENOSPC; sparse=1 mitigates but is not immunity (phase-1.5 metric; never fires until then) |
 | `XFSExporterStale` | `xfs_freesp_scrape_success == 0` for 30m | collection health |
 
-**Thresholds are heuristic — calibrate against your fleet.** `XFSFragmentationRising`
-needs ~26h of history (`deriv[24h]` + `for:2h`) before it means anything: on nodes
-younger than a day the `deriv` fits a slope over partial data and swings wildly
-(seen -2.1…+1.2/day on 6h-old nodes), so expect noisy pending alerts until history
-matures. Tune `fragRatePerDay` from the observed distribution; `agsizeBytes` is a
-homogeneous-fleet constant (`350336 × 4096`) — replace per-fleet.
+**Thresholds are heuristic — calibrate against your fleet.** `XFSSmallAverageExtent`
+is the reliable trigger; `XFSFragmentationRising` is kept only as informational — it
+needs ~26h of history (`deriv[24h]` + `for:2h`) and on nodes younger than a day the
+`deriv` fits a slope over partial data and swings wildly (seen -2.1…+1.2/day, and a
+spurious pending alert on a 6-hour-old node), so expect noisy pending alerts.
+`agsizeBytes` is a homogeneous-fleet constant (`350336 × 4096`) — replace per-fleet.
+
+**Remediation is node replacement** — there is no live in-place fix (`xfs_fsr` needs
+an unmount): cordon → drain → delete the machine (ROSA HCP via NodePool scaling,
+ROSA Classic via MachineSet). Reduce the fragmentation *rate* preventively by
+switching Fluent Bit to memory buffering where log loss is tolerable, or capping
+`storage.max_chunks_up` / `storage.total_limit_size`, and by rotating long-lived nodes.
+
+## Background / references
+
+The failure this tool surfaces — XFS returning ENOSPC while `df`/`du` still show
+free GiB on ROSA HCP / RHCOS — is **XFS free-space fragmentation** (Red Hat kernel
+tracking **RHEL-82924**, confirmed expected behaviour, not a bug), not inode
+exhaustion. The confirmed trigger is the **Fluent Bit / fluentd filesystem
+buffer**: kernel tracing showed fluent-bit drives ~42× more XFS extent allocations
+than any other process, so high-log-volume pods accelerate it and risk grows with
+node age. This exporter is a working implementation of **RFE-9762** (expose the
+detection metric via OpenShift Monitoring and enable node remediation). See
+[`xfs-frag-exporter-SPEC.md`](./xfs-frag-exporter-SPEC.md) and
+[`docs/adr/`](./docs/adr) for the full evidence trail.
 
 ## Configuration (env)
 

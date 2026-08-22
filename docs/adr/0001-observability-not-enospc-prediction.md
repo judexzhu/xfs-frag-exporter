@@ -1,7 +1,7 @@
 # 1. Reframe from ENOSPC prediction to fragmentation observability
 
 Date: 2026-08-21
-Status: Accepted
+Status: Accepted (rate-not-level reasoning superseded in part by ADR-0003)
 
 ## Context
 

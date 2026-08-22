@@ -1,0 +1,136 @@
+# XFS free-space fragmentation reproducer — proves xfs-frag-exporter detects the
+# RHEL-82924 danger geometry (see docs/adr/0003, SPEC §1b).
+#
+# What it does, in one privileged pod:
+#   1. builds the exporter from source (git HEAD),
+#   2. creates a loopback XFS with the DEFAULT geometry (sparse=1) — the real,
+#      unchangeable ROSA HCP config,
+#   3. fills it, then punches 4 KiB holes every 8 KiB so free space collapses to
+#      ~1-block extents (what months of Fluent Bit small-file churn does),
+#   4. runs the real exporter against it and prints /metrics,
+#   5. shows xfs_spaceman 'freesp -s' as ground truth.
+#
+# Expected: xfs_free_extent_avg_bytes drops to ~4.7 KiB (<< the 64 KiB / 16-block
+# critical floor) and density climbs past ~16384 — i.e. XFSSmallAverageExtent
+# fires — matching freesp -s to the block.
+#
+# HONEST SCOPE: this proves DETECTION of the danger geometry, which is what the
+# tool (and RFE-9762) is for. It does NOT reproduce the creat() ENOSPC crash:
+# sparse=1 tolerates synthetic punch-hole fragmentation (the pod confirms this by
+# creating 20000 files without ENOSPC). The real ENOSPC needs the specific
+# in-kernel conditions of RHEL-82924.
+#
+# Requires the 'privileged' SCC (loop device + mount). Run on a throwaway/test
+# node; it writes a ~2 GiB image to node /var (emptyDir), auto-removed on delete.
+#
+# Deploy:   oc apply -f deploy/examples/reproducer.yaml
+# Watch:    oc -n xfs-repro logs -f xfs-repro
+# Clean up: oc -n xfs-repro exec xfs-repro -- sh -c 'umount /mnt/x; losetup -D' ; oc delete ns xfs-repro
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: xfs-repro
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fragmenter
+  namespace: xfs-repro
+---
+# OpenShift: grant the privileged SCC (equivalent to `oc adm policy add-scc-to-user`).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fragmenter-privileged
+  namespace: xfs-repro
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+  - kind: ServiceAccount
+    name: fragmenter
+    namespace: xfs-repro
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xfs-repro
+  namespace: xfs-repro
+  labels: { app: xfs-repro }
+spec:
+  serviceAccountName: fragmenter
+  restartPolicy: Never
+  containers:
+    - name: repro
+      image: golang:1.23
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq && apt-get install -y -qq xfsprogs util-linux wget >/dev/null
+          echo "== build the real exporter from source =="
+          cd /tmp && git clone --depth 1 https://github.com/judexzhu/xfs-frag-exporter >/dev/null 2>&1
+          cd xfs-frag-exporter && CGO_ENABLED=0 go build -o /exporter . && echo "built $(git rev-parse --short HEAD)"
+
+          IMG=/work/xfs.img; FS_GB=${FS_GB:-2}
+          truncate -s ${FS_GB}G "$IMG"
+          mkfs.xfs -q -f "$IMG"                       # DEFAULT geometry = sparse=1, the real ROSA HCP config
+          modprobe loop 2>/dev/null || true
+          [ -e /dev/loop-control ] || mknod /dev/loop-control c 10 237
+          if ! LOOP=$(losetup --find --show "$IMG" 2>/dev/null); then
+            for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+            LOOP=$(losetup --find --show "$IMG")
+          fi
+          echo "loop=$LOOP"
+          mkdir -p /mnt/x && mount "$LOOP" /mnt/x
+          echo "== fresh fs (customer geometry) =="; xfs_info /mnt/x | grep -E 'isize|imaxpct|spinodes'; df -h /mnt/x | tail -1
+
+          echo "== consume ~all free blocks with one file =="
+          avail=$(df -B1 --output=avail /mnt/x | tail -1)
+          if ! fallocate -l "$avail" /mnt/x/big 2>/dev/null; then
+            sz=$avail; while ! fallocate -l "$sz" /mnt/x/big 2>/dev/null; do sz=$((sz*95/100)); done
+          fi
+          fsize=$(stat -c %s /mnt/x/big)
+
+          echo "== fragment: 4 KiB holes every 8 KiB -> avg free extent ~4 KiB (<64 KiB) =="
+          awk -v fs="$fsize" 'BEGIN{for(o=0;o+4096<=fs;o+=8192)printf "fpunch %d 4096\n",o; print "quit"}' \
+            | xfs_io /mnt/x/big
+          sync
+          echo "== ground truth (xfs_spaceman freesp -s) =="
+          xfs_spaceman -c 'freesp -s' /mnt/x || true
+          echo "df -h:"; df -h /mnt/x | tail -1
+          echo "df -i:"; df -i /mnt/x | tail -1
+
+          echo "== the real xfs-frag-exporter, pointed at the fragmented fs =="
+          HOST_ROOT=/mnt/x LISTEN_ADDR=:9101 NODE_NAME=repro DEBUG_GETFSMAP=1 /exporter &
+          sleep 6
+          wget -qO- localhost:9101/metrics | grep -E '^xfs_' || true
+
+          echo "== does file creation still work on sparse=1? (honest check) =="
+          n=0
+          while [ "$n" -lt 20000 ]; do
+            if ! : > "/mnt/x/f_$n" 2>/tmp/e; then echo "ENOSPC creating file #$n:"; cat /tmp/e; break; fi
+            n=$((n+1))
+          done
+          [ "$n" -ge 20000 ] && echo "created 20000 files, no ENOSPC -- sparse=1 tolerates this synthetic fragmentation (expected); the DANGER is the geometry the exporter flagged above"
+          echo "after -> df -h:"; df -h /mnt/x | tail -1
+          echo "after -> df -i:"; df -i /mnt/x | tail -1
+          echo "== DONE; holding for inspection =="
+          exec sleep infinity
+      env:
+        - { name: FS_GB, value: "2" }
+      securityContext:
+        privileged: true
+        runAsUser: 0
+      volumeMounts:
+        - { name: work, mountPath: /work }
+  volumes:
+    - name: work
+      emptyDir:
+        sizeLimit: 5Gi
