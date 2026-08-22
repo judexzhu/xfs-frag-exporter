@@ -104,6 +104,27 @@ All knobs are in [`chart/xfs-frag-exporter/values.yaml`](./chart/xfs-frag-export
   (`enableUserWorkload: true` in `cluster-monitoring-config`), grant yourself
   `monitoring-edit` + `monitoring-rules-edit`, then `--set serviceMonitor.enabled=true`.
 
+## Alerting
+
+Recording rule + alerts live in [`deploy/prometheusrule.yaml`](./deploy/prometheusrule.yaml)
+(chart: `--set prometheusRule.enabled=true`). With `clusterMonitoring.enabled=true`
+the platform `prometheus-k8s` **evaluates** the `PrometheusRule` too (same
+`openshift.io/cluster-monitoring` label that grants scrape) — no UWM needed.
+
+| Alert | Fires on | Meaning |
+|---|---|---|
+| `XFSFragmentationRising` | `node:xfs_frag_density:rate1d > 1.05` for 2h | fragmenting >3× the ~0.35/day aging baseline — a sick node |
+| `XFSLowContiguity` | `max_extent / agsize < 0.10` for 30m | largest free extent collapsing — approaching dead |
+| `XFSSparseInodesDisabled` | `xfs_sparse_inodes_enabled == 0` | re-opens the ENOSPC path (phase-1.5 metric; never fires until then) |
+| `XFSExporterStale` | `xfs_freesp_scrape_success == 0` for 30m | collection health |
+
+**Thresholds are heuristic — calibrate against your fleet.** `XFSFragmentationRising`
+needs ~26h of history (`deriv[24h]` + `for:2h`) before it means anything: on nodes
+younger than a day the `deriv` fits a slope over partial data and swings wildly
+(seen -2.1…+1.2/day on 6h-old nodes), so expect noisy pending alerts until history
+matures. Tune `fragRatePerDay` from the observed distribution; `agsizeBytes` is a
+homogeneous-fleet constant (`350336 × 4096`) — replace per-fleet.
+
 ## Configuration (env)
 
 | Var | Default | Meaning |
