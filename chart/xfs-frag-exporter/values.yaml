@@ -35,6 +35,13 @@ securityContext:
   # one, and CRI-O applies RuntimeDefault by default anyway. On vanilla k8s you
   # may add `seccompProfile: {type: RuntimeDefault}` here.
 
+# OpenShift: hostPath needs an SCC that allows it. Enable to have the chart bind
+# the ServiceAccount to one (no manual `oc adm policy` needed). Leave false on
+# vanilla Kubernetes.
+rbac:
+  sccBinding: false
+  sccName: hostmount-anyuid
+
 nodeSelector:
   kubernetes.io/os: linux
 

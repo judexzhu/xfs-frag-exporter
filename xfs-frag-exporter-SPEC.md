@@ -140,9 +140,21 @@ discovered XFS mount.
 - Keep records with `FMR_OF_SPECIAL_OWNER` set and `fmr_owner == FMR_OWN_FREE`.
   From `fmr_length` compute count, Σ bytes, max, and (1.5) buckets.
 - `statfs` per mount for total/avail bytes and inode counts.
-- **Open impl checks**: (1) `fmh_keys[].fmr_device` cookie for single-device XFS
-  (set both keys the same, or use `FMH_OF_DEV_T`); (2) whether `XFS_IOC_FSGEOMETRY`
-  needs `CAP_SYS_ADMIN` (only matters when phase-1.5 config metrics land).
+- **Validated on a live RHCOS node** (ROSA, OCP 4.20, kernel 5.14 el9, amd64):
+  matched `xfs_spaceman -c 'freesp -s'` — ≈502 free extents, density ≈1.07,
+  MAX_EXT ≈ agsize. Gotchas found only on-cluster:
+  1. Query the whole device with the low key all-zero and the high key
+     `device`/`physical`/`owner`/`offset` maxed — do **not** set the high key's
+     `fmr_flags` (the kernel validates key flags).
+  2. Free extents match by **`fmr_owner` low-32 == 1**: the kernel reports the
+     bare `FMR_OWN_FREE` code (`0x1`), not the documented `FMR_OWNER('X',1)`
+     (`0x5800000001`).
+  3. Discover mounts from the container's own `/proc/self/mountinfo` (the host FS
+     appears under `/host` via mount propagation) and dedupe by device — free
+     space is per-filesystem, not per-mount.
+  4. hostPath on OpenShift needs an SCC that allows it (`hostmount-anyuid`), and
+     that SCC forbids setting `seccompProfile` (CRI-O applies RuntimeDefault
+     anyway). `XFS_IOC_FSGEOMETRY` cap requirement still open (phase 1.5).
 
 ## 5. Rules & alerts (deferred — separate PrometheusRule file, not the binary)
 

@@ -54,6 +54,8 @@ docker buildx build --platform linux/amd64,linux/arm64 -t $REG:latest --push .
 ```sh
 oc apply -f deploy/namespace.yaml
 oc apply -f deploy/rbac.yaml
+# OpenShift: hostPath needs an SCC that allows it (restricted-v2 doesn't)
+oc adm policy add-scc-to-user hostmount-anyuid -z xfs-frag-exporter -n xfs-frag-exporter
 oc apply -f deploy/daemonset.yaml
 oc apply -f deploy/service.yaml
 ```
@@ -69,6 +71,8 @@ oc -n xfs-frag-exporter exec ds/xfs-frag-exporter -- wget -qO- localhost:9101/me
 
 ```sh
 helm install xfs-frag-exporter ./chart/xfs-frag-exporter
+# OpenShift: also bind an SCC that allows hostPath
+helm install xfs-frag-exporter ./chart/xfs-frag-exporter --set rbac.sccBinding=true
 ```
 
 The chart creates the `xfs-frag-exporter` namespace (with the required privileged
