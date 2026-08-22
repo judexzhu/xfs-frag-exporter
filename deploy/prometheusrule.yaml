@@ -1,9 +1,14 @@
 # XFS fragmentation alerts. See docs/adr/0001 and SPEC §5.
 #
-# PRIMARY SIGNAL = average free-extent size (xfs_free_extent_avg_bytes). When it
-# falls below ~16 blocks (64 KiB) XFS can return ENOSPC while free space remains
-# (RHEL-82924; confirmed on ROSA HCP, RFE-9762). AWS EKS alerts on the same
-# quantity as XFSSmallAverageClusterSize. This is a LEVEL threshold, not a rate.
+# PRIMARY SIGNAL = fraction of free extents under 64 KiB
+# (xfs_free_extents_small / xfs_free_extents). When most free extents are tiny,
+# XFS can return ENOSPC while free space remains (RHEL-82924; confirmed on ROSA
+# HCP, RFE-9762). This fired on every live-incident node in the field evidence
+# (95.3-97.6% under ~60 KiB). It is COUNT-based, so it catches the heavy-tail case
+# the byte-average misses: node ip-10-26-86-71 had 264 GB free / 652,406 extents
+# — avg ~424 KiB, ABOVE the 64 KiB floor, so XFSSmallAverageExtent would NOT have
+# fired — yet 97.6% of extents were tiny. XFSSmallAverageExtent (the AWS EKS
+# XFSSmallAverageClusterSize quantity) is kept as a corroborating LEVEL signal.
 #
 # The deriv()-based rate alert (XFSFragmentationRising) is kept only as a weak,
 # informational secondary — rate-of-fragmentation PromQL has been observed to
@@ -11,6 +16,7 @@
 # not page on it.
 #
 # THRESHOLDS ARE HEURISTIC DEFAULTS, NOT FLEET-CALIBRATED. Tune them:
+#   - 0.90 = fraction of free extents under 64 KiB; incident nodes were 0.95-0.98.
 #   - 65536 B = 16 blocks: the EKS/RHEL-82924 critical avg-free-extent size.
 #   - 0.10 = MAX_EXT as a fraction of an allocation group; healthy ~0.99.
 #   - agsize (1434976256 B = 350336 blks x 4096) is hardcoded as a homogeneous-
@@ -33,9 +39,25 @@ spec:
 
     - name: xfs-frag.alerts
       rules:
-        # PRIMARY (RHEL-82924 / EKS XFSSmallAverageClusterSize): average free
-        # extent below 16 blocks (64 KiB). XFS can ENOSPC creating files while
-        # free space remains. This is the reliable, field-validated signal.
+        # PRIMARY (RHEL-82924): most free extents are too small to allocate an
+        # inode cluster. Count-based, so it catches the heavy-tail case the
+        # byte-average misses. Fired on every live-incident node (0.95-0.98).
+        - alert: XFSFreeSpaceFragmented
+          expr: xfs_free_extents_small / xfs_free_extents > 0.90
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "XFS free space shattered on {{ $labels.node }} {{ $labels.mountpoint }}"
+            description: >-
+              {{ $value | humanizePercentage }} of free extents are < 64 KiB;
+              creat()/mkdir() can ENOSPC while GiB remain free (RHEL-82924). Drain
+              and replace the node; in-place xfs_fsr needs an unmount.
+
+        # CORROBORATING (EKS XFSSmallAverageClusterSize): mean free extent below
+        # 16 blocks (64 KiB). A LEVEL signal that confirms the primary when free
+        # space is uniformly shredded; it can miss a heavy tail of large extents
+        # (see the header note on node ip-10-26-86-71), so do not rely on it alone.
         - alert: XFSSmallAverageExtent
           expr: xfs_free_extent_avg_bytes < 65536
           for: 30m

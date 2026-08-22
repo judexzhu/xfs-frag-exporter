@@ -1,11 +1,12 @@
 # Reproducers — validating that the exporter catches the real bug
 
-Two manifests here reproduce the XFS free-space-fragmentation problem that hits
+Three manifests here reproduce the XFS free-space-fragmentation problem that hits
 long-lived OpenShift / ROSA HCP nodes (Red Hat kernel tracking **RHEL-82924**,
 Jira **RFE-9762**), and prove `xfs-frag-exporter` detects it.
 
 | File | Goal | Verified? |
 |---|---|---|
+| [`reproducer-node-var.yaml`](./reproducer-node-var.yaml) | The **field-evidence state** on the node's real `/var` — free space shattered into tiny extents while GiB stay free — caught by the deployed exporter via `xfs_free_extents_small`. Bounded; does not fill `/var` | Detection reproduced |
 | [`reproducer.yaml`](./reproducer.yaml) | Prove **detection** — drive avg free extent below the danger floor and show the exporter reports it, matching `xfs_spaceman` | **Yes** (live) |
 | [`reproducer-enospc.yaml`](./reproducer-enospc.yaml) | The actual **`creat()` ENOSPC with free space** on `sparse=1`, mimicking Fluent Bit small-file churn | **Yes** (live) |
 
@@ -35,17 +36,22 @@ fragmented:[F][X][F][X][F][X][F][X][F][X][F][X][F][X]   no 2-block run -> creat(
 
 ## How the exporter finds it
 
-`xfs-frag-exporter` issues `XFS_IOC_GETFSMAP` and aggregates every free extent, so
-it can measure the mean contiguous free-extent size directly:
+`xfs-frag-exporter` issues `XFS_IOC_GETFSMAP` and aggregates every free extent. The
+**primary signal is the fraction of free extents under 64 KiB** (16 blocks):
 
 ```
-xfs_free_extent_avg_bytes = xfs_free_bytes / xfs_free_extents
+xfs_free_extents_small / xfs_free_extents > 0.90
 ```
 
-When that average falls below **16 blocks (64 KiB)**, XFS is in the danger zone.
-This is the same quantity **AWS EKS's Node Monitoring Agent (NMA)** alerts on,
-named `XFSSmallAverageClusterSize` (threshold: avg free extent < 16 blocks) —
-OpenShift has no built-in equivalent, which is what RFE-9762 is asking for.
+This is what fired on every live-incident node in the field evidence (0.95–0.98).
+It is COUNT-based, which matters: the **byte-average** `xfs_free_extent_avg_bytes`
+(= `xfs_free_bytes / xfs_free_extents`) is a good corroborating level and matches
+the quantity **AWS EKS's Node Monitoring Agent** alerts on (`XFSSmallAverageClusterSize`,
+avg < 16 blocks) — but a few large free extents keep the mean high even when almost
+every extent is tiny. The customer's live-incident node `ip-10-26-86-71` had 264 GB
+free across 652,406 extents (avg ~424 KiB, **above** the 64 KiB floor) yet **97.6%
+of extents were < 60 KiB** — the average would have missed it; the fraction caught
+it. OpenShift has no built-in equivalent of either, which is what RFE-9762 asks for.
 
 The reproducers cross-check the exporter against `xfs_spaceman -c 'freesp -s'`
 ground truth. In the verified `reproducer.yaml` run (on a `sparse=1` fs):
@@ -57,23 +63,47 @@ ground truth. In the verified `reproducer.yaml` run (on a `sparse=1` fs):
 
 with `xfs_frag_density_extents_per_gib = 228134` (≫ the ~16384 critical level).
 
-### The alert (NMA parity)
+### The alerts
 
 Shipped in [`deploy/prometheusrule.yaml`](../prometheusrule.yaml) /
 `--set prometheusRule.enabled=true`:
 
 ```yaml
-- alert: XFSSmallAverageExtent          # == AWS NMA XFSSmallAverageClusterSize
+- alert: XFSFreeSpaceFragmented          # PRIMARY — count-based, caught the incident nodes
+  expr: xfs_free_extents_small / xfs_free_extents > 0.90
+  for: 30m
+- alert: XFSSmallAverageExtent           # corroborating; == AWS NMA XFSSmallAverageClusterSize
   expr: xfs_free_extent_avg_bytes < 65536   # 16 blocks x 4 KiB
   for: 30m
 ```
 PromQL for ad-hoc checks:
 ```promql
-xfs_free_extent_avg_bytes < 65536             # at/under the 16-block floor
-topk(10, xfs_frag_density_extents_per_gib)    # rank worst mounts (reciprocal signal)
+xfs_free_extents_small / xfs_free_extents > 0.90   # PRIMARY: most free extents tiny
+xfs_free_extent_avg_bytes < 65536                  # corroborating 16-block floor
+topk(10, xfs_frag_density_extents_per_gib)         # rank worst mounts (reciprocal signal)
 ```
 
 ## How to use
+
+### Real-world: node `/var` + deployed exporter (`reproducer-node-var.yaml`)
+
+Non-privileged (non-root, emptyDir, no loop/mount/hostPath). Edit `nodeName`, make
+sure the exporter DaemonSet is deployed with `--set resources.limits.memory=512Mi`
+(millions of extents need headroom), then:
+
+```sh
+oc apply -f deploy/examples/reproducer-node-var.yaml
+oc logs -f xfs-var-fragmenter                 # rounds of "isolated 4 KiB free shards"
+# then query the DEPLOYED exporter for that node:
+#   xfs_free_extents_small{node="<node>"} / xfs_free_extents{node="<node>"}   -> > 0.90
+#   xfs_free_extent_avg_bytes{node="<node>"}                                  -> stays > 65536
+oc delete pod xfs-var-fragmenter              # emptyDir freed, /var extents coalesce
+```
+
+Knob (pod `env`): `REGION_GB` (default 24) — bounds the fragmented region; net
+`/var` use self-caps at ~`REGION_GB/2`. Raise it to push the average down too.
+
+### Isolated loopback (`reproducer.yaml`, `reproducer-enospc.yaml`)
 
 Both need the `privileged` SCC (loop device + `mount`) — run on a **throwaway /
 test node**. Each writes a small loopback image to node `/var` (emptyDir),

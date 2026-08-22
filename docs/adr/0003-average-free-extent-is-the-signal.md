@@ -1,7 +1,8 @@
 # 3. Average free-extent size (level) is the sick-node signal, not the frag rate
 
 Date: 2026-08-21
-Status: Accepted
+Status: Accepted — refined by ADR-0004 (the count-fraction under 64 KiB, not the
+byte-average, is the primary signal; the average is demoted to corroborating)
 
 ## Context
 

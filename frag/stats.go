@@ -5,11 +5,19 @@ package frag
 
 const bytesPerGiB = 1 << 30
 
+// smallExtentBytes is the "too small to be useful" free-extent ceiling: 16 blocks
+// (64 KiB) at the 4 KiB XFS block size. A free extent below it cannot satisfy an
+// inode-cluster allocation once packing tightens, so once most free extents fall
+// under it XFS can ENOSPC with free space left (RHEL-82924). Extents are 4 KiB
+// multiples, so "< 65536" means "<= 60 KiB" — the customer's freesp-s bucket.
+const smallExtentBytes = 16 * 4096 // 65536
+
 // Stats summarises a filesystem's free extents.
 type Stats struct {
-	Extents   uint64 // number of free extents
-	FreeBytes uint64 // total free space (sum of extent lengths)
-	MaxBytes  uint64 // largest single free extent
+	Extents      uint64 // number of free extents
+	FreeBytes    uint64 // total free space (sum of extent lengths)
+	MaxBytes     uint64 // largest single free extent
+	SmallExtents uint64 // free extents smaller than 16 blocks (64 KiB)
 }
 
 // Aggregate reduces free-extent byte lengths to summary stats.
@@ -20,6 +28,9 @@ func Aggregate(extentBytes []uint64) Stats {
 		s.FreeBytes += n
 		if n > s.MaxBytes {
 			s.MaxBytes = n
+		}
+		if n < smallExtentBytes {
+			s.SmallExtents++
 		}
 	}
 	return s
@@ -38,10 +49,14 @@ func (s Stats) Density() float64 {
 }
 
 // AvgExtentBytes is the mean contiguous free-extent size (free bytes / free
-// extents). This is the field-validated fragmentation signal: when it falls below
-// ~16 blocks (64 KiB) XFS struggles to find contiguous runs for new allocations
-// and can return ENOSPC while free space remains (RHEL-82924). AWS EKS alerts on
-// the same quantity as XFSSmallAverageClusterSize. Returns 0 for no free extents.
+// extents). When it falls below ~16 blocks (64 KiB) XFS struggles to find
+// contiguous runs and can ENOSPC while free space remains (RHEL-82924); AWS EKS
+// alerts on the same quantity as XFSSmallAverageClusterSize. But it is a mean over
+// BYTES: a few large free extents keep it high even when almost every extent is a
+// tiny shard — the live-incident node ip-10-26-86-71 had 264 GB free / 652,406
+// extents (avg ~424 KiB, above the floor) yet 97.6% of extents were < 60 KiB. For
+// that heavy-tail case use SmallExtents / Extents, which counts extents and stays
+// near 1.0. Returns 0 for no free extents.
 func (s Stats) AvgExtentBytes() float64 {
 	if s.Extents == 0 {
 		return 0

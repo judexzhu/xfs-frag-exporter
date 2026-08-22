@@ -15,7 +15,8 @@ Per XFS mount (labelled `node` + `mountpoint` + `device`) it exposes:
 
 | Metric | Meaning |
 |---|---|
-| `xfs_free_extent_avg_bytes` | mean contiguous free extent — the fragmentation signal; ENOSPC-with-free-space risk when < 64 KiB |
+| `xfs_free_extents_small` | free extents < 64 KiB (16 blocks); ÷ `xfs_free_extents` = the primary signal |
+| `xfs_free_extent_avg_bytes` | mean contiguous free extent; ENOSPC-with-free-space risk when < 64 KiB (but a byte-mean — see below) |
 | `xfs_frag_density_extents_per_gib` | free extents ÷ free GiB — reciprocal of avg extent size (same signal) |
 | `xfs_free_extent_max_bytes` | largest contiguous free extent (ceilinged at agsize) |
 | `xfs_free_extents` | number of free extents |
@@ -23,19 +24,27 @@ Per XFS mount (labelled `node` + `mountpoint` + `device`) it exposes:
 | `xfs_freesp_scrape_duration_seconds` | cost of the GETFSMAP walk |
 | `xfs_freesp_scrape_success` | 1 if the last walk succeeded |
 
-**Identifying a sick node:** the primary, field-validated signal is the **average
-free-extent size** falling below **16 blocks (64 KiB)** — equivalently frag
-density rising above **~16384 extents/GiB** (the two are exact reciprocals). This
-is the same quantity AWS EKS's Node Monitoring Agent alerts on, named
-`XFSSmallAverageClusterSize`. Below this floor XFS can return ENOSPC while `df`
-still shows free GiB (Red Hat kernel tracking **RHEL-82924**); `df -i` looks
-healthy — it is free-space fragmentation, not inode exhaustion.
+**Identifying a sick node:** the primary, field-validated signal is the **fraction
+of free extents under 64 KiB** (`xfs_free_extents_small / xfs_free_extents`). On
+the customer's live-incident nodes this was **0.95–0.98**; below ~16 blocks a free
+extent can't satisfy an inode-cluster allocation, so XFS returns ENOSPC while `df`
+still shows free GiB (Red Hat kernel tracking **RHEL-82924**) and `df -i` looks
+healthy — free-space fragmentation, not inode exhaustion.
+
+The **average free-extent size < 64 KiB** (equivalently frag density above
+~16384 extents/GiB, the exact reciprocal; the AWS EKS `XFSSmallAverageClusterSize`
+quantity) is a good **corroborating** signal, but it is a mean over *bytes*: a few
+large free extents keep it high even when almost every extent is a tiny shard.
+Live-incident node `ip-10-26-86-71` had 264 GB free across 652,406 extents — avg
+~424 KiB, **above** the floor — yet 97.6% of extents were < 60 KiB. The count-based
+fraction catches that; the average alone would have missed it.
 
 ```promql
-# nodes at or past the 64 KiB critical floor
-xfs_free_extent_avg_bytes < 65536
+# PRIMARY: >90% of free extents are tiny — ENOSPC-with-free-space risk
+xfs_free_extents_small / xfs_free_extents > 0.90
 
-# rank the worst mounts by level
+# corroborating level, and rank the worst mounts
+xfs_free_extent_avg_bytes < 65536
 topk(10, xfs_frag_density_extents_per_gib)
 ```
 
@@ -129,14 +138,16 @@ the platform `prometheus-k8s` **evaluates** the `PrometheusRule` too (same
 
 | Alert | Fires on | Meaning |
 |---|---|---|
-| `XFSSmallAverageExtent` | `xfs_free_extent_avg_bytes < 65536` for 30m | **primary:** avg free extent below 16 blocks (64 KiB) — ENOSPC-with-free-space risk (RHEL-82924); matches EKS `XFSSmallAverageClusterSize` |
+| `XFSFreeSpaceFragmented` | `xfs_free_extents_small / xfs_free_extents > 0.90` for 30m | **primary:** most free extents < 64 KiB — ENOSPC-with-free-space risk (RHEL-82924); fired on every live-incident node (0.95–0.98) |
+| `XFSSmallAverageExtent` | `xfs_free_extent_avg_bytes < 65536` for 30m | corroborating: avg free extent below 16 blocks (64 KiB); matches EKS `XFSSmallAverageClusterSize`, but can miss a heavy tail of large extents |
 | `XFSLowContiguity` | `max_extent / agsize < 0.10` for 30m | largest free extent collapsing — approaching dead |
 | `XFSFragmentationRising` | `node:xfs_frag_density:rate1d > 1.05` for 2h | info / weak secondary — rate is false-positive prone; prefer the level above |
 | `XFSSparseInodesDisabled` | `xfs_sparse_inodes_enabled == 0` | sparse=0 aggravates fragmentation ENOSPC; sparse=1 mitigates but is not immunity (phase-1.5 metric; never fires until then) |
 | `XFSExporterStale` | `xfs_freesp_scrape_success == 0` for 30m | collection health |
 
-**Thresholds are heuristic — calibrate against your fleet.** `XFSSmallAverageExtent`
-is the reliable trigger; `XFSFragmentationRising` is kept only as informational — it
+**Thresholds are heuristic — calibrate against your fleet.** `XFSFreeSpaceFragmented`
+is the reliable trigger (`XFSSmallAverageExtent` corroborates but can miss the
+heavy-tail case above); `XFSFragmentationRising` is kept only as informational — it
 needs ~26h of history (`deriv[24h]` + `for:2h`) and on nodes younger than a day the
 `deriv` fits a slope over partial data and swings wildly (seen -2.1…+1.2/day, and a
 spurious pending alert on a 6-hour-old node), so expect noisy pending alerts.
@@ -181,16 +192,22 @@ xfs-frag-exporter`).
 
 ## Reproducing & validating
 
-[`deploy/examples/`](./deploy/examples) has two reproducers (and a walkthrough of
-the concept) that recreate the RHEL-82924 free-space-fragmentation bug on an
-isolated loopback XFS and prove the exporter detects it:
+[`deploy/examples/`](./deploy/examples) has three reproducers (and a walkthrough
+of the concept) that recreate the RHEL-82924 free-space-fragmentation bug and prove
+the exporter detects it:
 
-- `reproducer.yaml` — **verified**: fragments a `sparse=1` fs to ~1-block avg and
-  shows `xfs_free_extent_avg_bytes` matching `xfs_spaceman freesp -s` exactly
+- `reproducer-node-var.yaml` — recreates the **field-evidence state** on the node's
+  real `/var` and lets the deployed exporter catch it: a bounded fragmenter shatters
+  free space into millions of 4 KiB extents while GiB stay free, so
+  `xfs_free_extents_small / xfs_free_extents > 0.90` fires (`XFSFreeSpaceFragmented`)
+  while the byte-average stays *above* the floor — the exact node-`ip-10-26-86-71`
+  gap. Bounded footprint; does **not** fill `/var`.
+- `reproducer.yaml` — **verified**: fragments a `sparse=1` loopback fs to ~1-block
+  avg and shows `xfs_free_extent_avg_bytes` matching `xfs_spaceman freesp -s` exactly
   (4706 B ≡ 1.149 blocks), well past the 64 KiB alert floor.
 - `reproducer-enospc.yaml` — **verified**: mimics Fluent Bit small-file churn and
-  reproduces the actual `creat()` ENOSPC on `sparse=1` with **42% of blocks and
-  84% of inodes still free** (exporter read `xfs_free_extent_avg_bytes=4096`).
+  reproduces the actual `creat()` ENOSPC on `sparse=1` loopback with **42% of blocks
+  and 84% of inodes still free** (exporter read `xfs_free_extent_avg_bytes=4096`).
 
 See [`deploy/examples/README.md`](./deploy/examples/README.md) for the mechanism
 (why `sparse=1` is not immunity) and how the metric maps to AWS NMA's

@@ -1,0 +1,109 @@
+# Real-world reproducer: recreate the FIELD-EVIDENCE state on the node's real
+# /var, and let the DEPLOYED exporter catch it. This is RHEL-82924 as measured on
+# the customer's live-incident nodes -- free space shattered into tiny extents
+# while GiB stay free -- NOT a disk-full test.
+#
+# WHAT THE EVIDENCE SHOWED (node ip-10-26-86-71): 264 GB free across 652,406 free
+# extents, 97.6% of them < 60 KiB. The mean free extent was still ~424 KiB (ABOVE
+# the 64 KiB floor), so an average-based alert would MISS it -- but the COUNT of
+# tiny extents dominated. This reproducer recreates exactly that shape.
+#
+# HOW: writes to an emptyDir -> lands on the node's real /var XFS. It fallocates a
+# BOUNDED region and punches a 4 KiB hole every 8 KiB, turning that region's free
+# space into millions of isolated 4 KiB free extents (the "shards"). The rest of
+# /var stays free and contiguous -- so df still shows GiB free, the byte-average
+# stays high, but 99%+ of free EXTENTS are now tiny. Each round re-fills and
+# re-punches at a shifted offset (mimics Fluent Bit rotate/punch churn) so the
+# allocator keeps churning. Net footprint self-caps at ~REGION_GB/2 -- it does NOT
+# grow, does NOT fill /var, does NOT trigger DiskPressure.
+#
+#   REGION_GB=24 -> ~3.1M 4 KiB free shards, ~12 GiB net /var use held steady.
+#   Deployed exporter then reports for this node:
+#     xfs_free_extents_small / xfs_free_extents  > 0.90   -> XFSFreeSpaceFragmented FIRES
+#     xfs_free_extent_avg_bytes                  > 65536   -> XFSSmallAverageExtent stays quiet
+#   i.e. the new count signal catches what the byte-average misses -- the whole point.
+#
+# Raise REGION_GB to push the average down too (more shards, fewer big extents);
+# the default is tuned so the average stays ABOVE the floor to demonstrate the gap.
+#
+# NOTE: observing millions of extents needs exporter memory headroom -- raise its
+# limit or it OOMs and stops observing:
+#   helm upgrade xfs-frag-exporter ./chart/xfs-frag-exporter -n default \
+#     --set rbac.sccBinding=true --set clusterMonitoring.enabled=true \
+#     --set prometheusRule.enabled=true --set resources.limits.memory=512Mi
+#
+# Non-privileged (non-root + emptyDir; no loop, no mount, no host paths).
+# REVERSIBLE: delete the pod -> emptyDir freed -> /var extents coalesce -> recover.
+#
+# EDIT nodeName. Then: oc apply -f deploy/examples/reproducer-node-var.yaml
+# Watch: xfs_free_extents_small{node="<node>"} / xfs_free_extents{node="<node>"}
+# Clean up: oc delete pod xfs-var-fragmenter -n default
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xfs-var-fragmenter
+  namespace: default
+  labels: { app: xfs-var-fragmenter }
+spec:
+  restartPolicy: Never
+  nodeName: ip-10-0-2-196.eu-west-3.compute.internal
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: fragmenter
+      image: golang:1.23
+      env:
+        - { name: REGION_GB, value: "24" }  # bounded; net /var use self-caps at ~REGION_GB/2
+        - { name: HOME, value: /tmp }
+        - { name: GOCACHE, value: /tmp/.cache }
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -eu
+          cat > /tmp/punch.go <<'GO'
+          package main
+          import ( "fmt"; "os"; "strconv"; "syscall"; "time" )
+          const punch = 0x02 | 0x01 // FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
+          func main() {
+            gib, _ := strconv.Atoi(os.Getenv("REGION_GB")); if gib == 0 { gib = 24 }
+            region := int64(gib) << 30
+            f, err := os.Create("/work/frag")
+            if err != nil { fmt.Println("create:", err); os.Exit(1) }
+            fd := int(f.Fd())
+            for round := 0; ; round++ {
+              // (Re)allocate the whole region, then punch a 4 KiB hole every 8 KiB.
+              // Fill + re-punch each round keeps the footprint at ~region/2 while
+              // continuously re-fragmenting -- free space never grows, never fills.
+              if err := syscall.Fallocate(fd, 0, 0, region); err != nil {
+                fmt.Printf("fallocate %d GiB failed: %v -- lower REGION_GB\n", gib, err)
+                time.Sleep(30 * time.Second); continue
+              }
+              phase := int64(round%2) * 4096 // shift each round so the allocator keeps churning
+              var holes int64
+              for off := phase; off+4096 <= region; off += 8192 {
+                if err := syscall.Fallocate(fd, punch, off, 4096); err != nil { break }
+                holes++
+              }
+              f.Sync()
+              fmt.Printf("round %d: %d isolated 4 KiB free shards; ~%d MiB net /var use (bounded, free space intact)\n",
+                round, holes, (region/2)>>20)
+              time.Sleep(30 * time.Second)
+            }
+          }
+          GO
+          echo "== fragmenting node /var free space into shards (REGION_GB=$REGION_GB, bounded, no disk-fill) =="
+          echo "   watch DEPLOYED exporter: xfs_free_extents_small{node=\"$(hostname)\"} / xfs_free_extents"
+          exec go run /tmp/punch.go
+      volumeMounts:
+        - { name: work, mountPath: /work }
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+        seccompProfile: { type: RuntimeDefault }
+  volumes:
+    - name: work
+      emptyDir:
+        sizeLimit: 26Gi        # safety cap; net footprint self-limits to ~REGION_GB/2

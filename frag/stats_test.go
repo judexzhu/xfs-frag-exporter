@@ -37,6 +37,42 @@ func TestAggregateFixture(t *testing.T) {
 	if s.MaxBytes != 1_426_587_648 {
 		t.Errorf("MaxBytes = %d, want 1426587648", s.MaxBytes)
 	}
+	if s.SmallExtents != 0 { // every fixture extent is hundreds of KiB+, none small
+		t.Errorf("SmallExtents = %d, want 0", s.SmallExtents)
+	}
+}
+
+// TestSmallExtentsBoundary pins the "< 16 blocks (64 KiB)" rule: 60 KiB counts as
+// small, exactly 64 KiB does not.
+func TestSmallExtentsBoundary(t *testing.T) {
+	s := Aggregate([]uint64{4096, 61440 /*60 KiB*/, 65536 /*64 KiB*/, 65537, 1 << 20})
+	if s.SmallExtents != 2 {
+		t.Fatalf("SmallExtents = %d, want 2 (4096 and 60 KiB only)", s.SmallExtents)
+	}
+}
+
+// TestSmallRatioCatchesHeavyTail reproduces the live-incident node ip-10-26-86-71
+// profile: a few large free extents hold most of the bytes (mean stays ABOVE the
+// 64 KiB floor, so the average-based signal misses it) while the overwhelming
+// COUNT of extents are tiny shards (small ratio ~1.0 catches it). This is the gap
+// the customer evidence exposed and why xfs_free_extents_small exists.
+func TestSmallRatioCatchesHeavyTail(t *testing.T) {
+	var ext []uint64
+	for i := 0; i < 100; i++ { // 100 GiB of free bytes in a handful of big extents
+		ext = append(ext, 1<<30)
+	}
+	for i := 0; i < 636_748; i++ { // ~2.5 GiB in a flood of 4 KiB shards
+		ext = append(ext, 4096)
+	}
+	s := Aggregate(ext)
+
+	if avg := s.AvgExtentBytes(); avg <= smallExtentBytes {
+		t.Fatalf("AvgExtentBytes = %.0f, want ABOVE the %d floor (avg must MISS this)", avg, smallExtentBytes)
+	}
+	ratio := float64(s.SmallExtents) / float64(s.Extents)
+	if ratio < 0.90 {
+		t.Fatalf("small ratio = %.4f, want > 0.90 (count must CATCH this)", ratio)
+	}
 }
 
 func TestDensityFixture(t *testing.T) {

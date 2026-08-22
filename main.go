@@ -101,8 +101,12 @@ func (c *collector) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 // always emitted so a failing mount is still visible.
 func writeExposition(w io.Writer, node string, snap []mountResult) {
 	gauge(w, "xfs_free_extent_avg_bytes",
-		"Mean contiguous free-extent size; below ~64 KiB (16 blocks) XFS can ENOSPC with free space left (RHEL-82924).",
+		"Mean contiguous free-extent size; below ~64 KiB (16 blocks) XFS can ENOSPC with free space left (RHEL-82924). Mean over bytes — a few large extents keep it high, so pair it with xfs_free_extents_small.",
 		node, snap, func(r mountResult) (float64, bool) { return r.stats.AvgExtentBytes(), r.success })
+
+	gauge(w, "xfs_free_extents_small",
+		"Free extents smaller than 64 KiB (16 blocks). As a fraction of xfs_free_extents this is the field-validated RHEL-82924 signal (live-incident nodes: 95-98%); it catches heavy-tail fragmentation the byte-mean xfs_free_extent_avg_bytes misses.",
+		node, snap, func(r mountResult) (float64, bool) { return float64(r.stats.SmallExtents), r.success })
 
 	gauge(w, "xfs_frag_density_extents_per_gib",
 		"Free extents per GiB of free space; the exact reciprocal of avg extent size (2^30/avg).",

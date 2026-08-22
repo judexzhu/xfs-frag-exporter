@@ -5,7 +5,7 @@ namespaceCreate: true
 
 image:
   repository: ghcr.io/judexzhu/xfs-frag-exporter
-  tag: v0.1.1
+  tag: v0.2.0
   pullPolicy: IfNotPresent
 
 # Collection tuning.
@@ -64,7 +64,8 @@ clusterMonitoring:
 # Alert rules. Thresholds are HEURISTIC — calibrate against your fleet.
 prometheusRule:
   enabled: false
-  avgExtentMinBytes: "65536" # PRIMARY: avg free extent < 16 blocks (RHEL-82924 / EKS)
+  smallExtentRatio: "0.90" # PRIMARY: fraction of free extents < 64 KiB (incident nodes 0.95-0.98)
+  avgExtentMinBytes: "65536" # CORROBORATING: avg free extent < 16 blocks (RHEL-82924 / EKS)
   fragRatePerDay: "1.05" # secondary/info only; rate-based, false-positive prone
   maxExtentRatio: "0.10" # MAX_EXT as a fraction of an allocation group
   agsizeBytes: "1434976256" # fleet constant (350336 blks x 4096); replace per-fleet
