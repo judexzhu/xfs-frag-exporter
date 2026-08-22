@@ -53,6 +53,30 @@ func TestDensityZeroFree(t *testing.T) {
 	}
 }
 
+func TestAvgExtentBytesFixture(t *testing.T) {
+	got := Aggregate(fixtureExtents()).AvgExtentBytes()
+	const want = 306_131_783_680.0 / 358 // ~855,116,713.6 bytes (~815 MiB, healthy)
+	if math.Abs(got-want) > 1 {
+		t.Fatalf("AvgExtentBytes = %.1f, want %.1f", got, want)
+	}
+}
+
+// Density and AvgExtentBytes are exact reciprocals scaled by a GiB: their product
+// is 2^30. This is the invariant that lets the EKS "avg < 16 blocks" threshold and
+// the density threshold be one and the same signal.
+func TestDensityAvgReciprocal(t *testing.T) {
+	s := Aggregate(fixtureExtents())
+	if got := s.Density() * s.AvgExtentBytes(); math.Abs(got-bytesPerGiB) > 1 {
+		t.Fatalf("Density*AvgExtentBytes = %.1f, want 2^30 = %d", got, bytesPerGiB)
+	}
+}
+
+func TestAvgExtentBytesZeroExtents(t *testing.T) {
+	if a := (Stats{FreeBytes: 100}).AvgExtentBytes(); a != 0 {
+		t.Fatalf("AvgExtentBytes with zero extents = %v, want 0", a)
+	}
+}
+
 func TestAggregateEmpty(t *testing.T) {
 	s := Aggregate(nil)
 	if s != (Stats{}) {

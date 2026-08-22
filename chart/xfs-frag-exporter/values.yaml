@@ -64,6 +64,7 @@ clusterMonitoring:
 # Alert rules. Thresholds are HEURISTIC — calibrate against your fleet.
 prometheusRule:
   enabled: false
-  fragRatePerDay: "1.05" # >3x the ~0.35/day aging baseline
+  avgExtentMinBytes: "65536" # PRIMARY: avg free extent < 16 blocks (RHEL-82924 / EKS)
+  fragRatePerDay: "1.05" # secondary/info only; rate-based, false-positive prone
   maxExtentRatio: "0.10" # MAX_EXT as a fraction of an allocation group
   agsizeBytes: "1434976256" # fleet constant (350336 blks x 4096); replace per-fleet

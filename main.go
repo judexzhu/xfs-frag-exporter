@@ -100,8 +100,12 @@ func (c *collector) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 // gauges are emitted only for mounts whose walk succeeded; success/duration are
 // always emitted so a failing mount is still visible.
 func writeExposition(w io.Writer, node string, snap []mountResult) {
+	gauge(w, "xfs_free_extent_avg_bytes",
+		"Mean contiguous free-extent size; below ~64 KiB (16 blocks) XFS can ENOSPC with free space left (RHEL-82924).",
+		node, snap, func(r mountResult) (float64, bool) { return r.stats.AvgExtentBytes(), r.success })
+
 	gauge(w, "xfs_frag_density_extents_per_gib",
-		"Free extents per GiB of free space; its rate of change identifies sick nodes.",
+		"Free extents per GiB of free space; the exact reciprocal of avg extent size (2^30/avg).",
 		node, snap, func(r mountResult) (float64, bool) { return r.stats.Density(), r.success })
 
 	gauge(w, "xfs_free_extent_max_bytes",

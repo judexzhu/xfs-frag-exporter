@@ -26,12 +26,25 @@ func Aggregate(extentBytes []uint64) Stats {
 }
 
 // Density is free extents per GiB of free space (extents/GiB). It is the exact
-// reciprocal of average free-extent size; its *rate of change* — not its level —
-// is what identifies a fragmenting ("sick") node. Returns 0 when there is no
-// free space, to avoid a divide-by-zero.
+// reciprocal of AvgExtentBytes (density = 2^30 / avg), so it is a pure measure of
+// fragmentation *quality* independent of how much free space there is — its level,
+// not merely its rate, tracks how fragmented the filesystem is. Returns 0 when
+// there is no free space, to avoid a divide-by-zero.
 func (s Stats) Density() float64 {
 	if s.FreeBytes == 0 {
 		return 0
 	}
 	return float64(s.Extents) / (float64(s.FreeBytes) / bytesPerGiB)
+}
+
+// AvgExtentBytes is the mean contiguous free-extent size (free bytes / free
+// extents). This is the field-validated fragmentation signal: when it falls below
+// ~16 blocks (64 KiB) XFS struggles to find contiguous runs for new allocations
+// and can return ENOSPC while free space remains (RHEL-82924). AWS EKS alerts on
+// the same quantity as XFSSmallAverageClusterSize. Returns 0 for no free extents.
+func (s Stats) AvgExtentBytes() float64 {
+	if s.Extents == 0 {
+		return 0
+	}
+	return float64(s.FreeBytes) / float64(s.Extents)
 }

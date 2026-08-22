@@ -1,15 +1,21 @@
 # XFS fragmentation alerts. See docs/adr/0001 and SPEC §5.
 #
+# PRIMARY SIGNAL = average free-extent size (xfs_free_extent_avg_bytes). When it
+# falls below ~16 blocks (64 KiB) XFS can return ENOSPC while free space remains
+# (RHEL-82924; confirmed on ROSA HCP, RFE-9762). AWS EKS alerts on the same
+# quantity as XFSSmallAverageClusterSize. This is a LEVEL threshold, not a rate.
+#
+# The deriv()-based rate alert (XFSFragmentationRising) is kept only as a weak,
+# informational secondary — rate-of-fragmentation PromQL has been observed to
+# false-positive across production clusters (and needs ~26h of history), so do
+# not page on it.
+#
 # THRESHOLDS ARE HEURISTIC DEFAULTS, NOT FLEET-CALIBRATED. Tune them:
-#   - 1.05/day = 3x the ~0.35 extents/GiB/day aging baseline, itself only 3
-#     cross-sectional data points. Set from your own observed distribution.
+#   - 65536 B = 16 blocks: the EKS/RHEL-82924 critical avg-free-extent size.
 #   - 0.10 = MAX_EXT as a fraction of an allocation group; healthy ~0.99.
 #   - agsize (1434976256 B = 350336 blks x 4096) is hardcoded as a homogeneous-
 #     fleet constant. Replace with the xfs_agsize_bytes metric once FSGEOMETRY
 #     collection ships (phase 1.5).
-#
-# XFSFragmentationRising needs ~26h of history (deriv[24h] + for:2h) before it
-# can fire.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -27,18 +33,34 @@ spec:
 
     - name: xfs-frag.alerts
       rules:
-        # SICK (early): fragmenting abnormally fast for its age.
+        # PRIMARY (RHEL-82924 / EKS XFSSmallAverageClusterSize): average free
+        # extent below 16 blocks (64 KiB). XFS can ENOSPC creating files while
+        # free space remains. This is the reliable, field-validated signal.
+        - alert: XFSSmallAverageExtent
+          expr: xfs_free_extent_avg_bytes < 65536
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "XFS free space critically fragmented on {{ $labels.node }} {{ $labels.mountpoint }}"
+            description: >-
+              avg free extent {{ $value | printf "%.0f" }} B (< 64 KiB / 16 blocks);
+              file creation may ENOSPC with free space left (RHEL-82924). Drain and
+              replace the node; in-place xfs_fsr needs an unmount.
+
+        # SECONDARY / INFO ONLY: rate of fragmentation. Rate-based PromQL
+        # false-positives across clusters and needs ~26h history — do not page.
         - alert: XFSFragmentationRising
           expr: node:xfs_frag_density:rate1d > 1.05
           for: 2h
           labels:
-            severity: warning
+            severity: info
           annotations:
             summary: "XFS fragmenting fast on {{ $labels.node }} {{ $labels.mountpoint }}"
             description: >-
-              frag_density rising {{ $value | printf "%.2f" }} extents/GiB/day
-              (>3x the ~0.35/day aging baseline) for 2h. Rank the fleet with
-              topk(10, node:xfs_frag_density:rate1d).
+              frag_density rising {{ $value | printf "%.2f" }} extents/GiB/day for 2h.
+              Weak signal (rate-based, false-positive prone); confirm with
+              xfs_free_extent_avg_bytes.
 
         # APPROACHING DEAD: largest free extent collapsing vs the AG ceiling.
         - alert: XFSLowContiguity
@@ -52,18 +74,20 @@ spec:
               MAX_EXT is {{ $value | printf "%.2f" }} of agsize (healthy ~0.99);
               contiguity is collapsing.
 
-        # REAL DANGER: sparse inodes off re-opens the classic ENOSPC path.
-        # Requires the phase-1.5 FSGEOMETRY metric; harmless (never fires) until then.
+        # AGGRAVATING FACTOR: sparse inodes off. sparse=1 does NOT make a node
+        # immune to fragmentation ENOSPC (RHEL-82924 hits sparse=1 nodes too), but
+        # sparse=0 lowers the bar further by requiring a full contiguous inode
+        # chunk. Requires the phase-1.5 FSGEOMETRY metric; never fires until then.
         - alert: XFSSparseInodesDisabled
           expr: xfs_sparse_inodes_enabled == 0
           for: 1h
           labels:
-            severity: warning
+            severity: info
           annotations:
             summary: "XFS sparse inodes DISABLED on {{ $labels.node }} {{ $labels.mountpoint }}"
             description: >-
-              sparse=0: free-space fragmentation can cause creat() ENOSPC.
-              Unexpected on RHEL9/RHCOS.
+              sparse=0 makes fragmentation ENOSPC even easier to hit. Unexpected
+              on RHEL9/RHCOS.
 
         # Collection health.
         - alert: XFSExporterStale

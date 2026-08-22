@@ -15,15 +15,25 @@ spec:
           expr: deriv(xfs_frag_density_extents_per_gib[24h]) * 86400
     - name: xfs-frag.alerts
       rules:
-        # SICK (early): fragmenting abnormally fast for its age.
+        # PRIMARY (RHEL-82924 / EKS XFSSmallAverageClusterSize): avg free extent
+        # below 16 blocks (64 KiB) -> XFS can ENOSPC with free space left.
+        - alert: XFSSmallAverageExtent
+          expr: xfs_free_extent_avg_bytes < {{ .Values.prometheusRule.avgExtentMinBytes }}
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: {{ `"XFS free space critically fragmented on {{ $labels.node }} {{ $labels.mountpoint }}"` }}
+            description: {{ `"avg free extent {{ $value | printf \"%.0f\" }} B (< 64 KiB); creat() may ENOSPC with free space left (RHEL-82924). Drain and replace the node."` }}
+        # SECONDARY / INFO ONLY: rate-based, false-positive prone. Do not page.
         - alert: XFSFragmentationRising
           expr: node:xfs_frag_density:rate1d > {{ .Values.prometheusRule.fragRatePerDay }}
           for: 2h
           labels:
-            severity: warning
+            severity: info
           annotations:
             summary: {{ `"XFS fragmenting fast on {{ $labels.node }} {{ $labels.mountpoint }}"` }}
-            description: {{ `"frag_density rising {{ $value | printf \"%.2f\" }} extents/GiB/day for 2h."` }}
+            description: {{ `"frag_density rising {{ $value | printf \"%.2f\" }} extents/GiB/day for 2h (weak signal; confirm with xfs_free_extent_avg_bytes)."` }}
         # APPROACHING DEAD: largest free extent collapsing vs the AG ceiling.
         - alert: XFSLowContiguity
           expr: xfs_free_extent_max_bytes / {{ .Values.prometheusRule.agsizeBytes }} < {{ .Values.prometheusRule.maxExtentRatio }}
