@@ -188,8 +188,9 @@ isolated loopback XFS and prove the exporter detects it:
 - `reproducer.yaml` — **verified**: fragments a `sparse=1` fs to ~1-block avg and
   shows `xfs_free_extent_avg_bytes` matching `xfs_spaceman freesp -s` exactly
   (4706 B ≡ 1.149 blocks), well past the 64 KiB alert floor.
-- `reproducer-enospc.yaml` — mimics Fluent Bit small-file churn to attempt the
-  actual `creat()` ENOSPC-with-free-space on `sparse=1`.
+- `reproducer-enospc.yaml` — **verified**: mimics Fluent Bit small-file churn and
+  reproduces the actual `creat()` ENOSPC on `sparse=1` with **42% of blocks and
+  84% of inodes still free** (exporter read `xfs_free_extent_avg_bytes=4096`).
 
 See [`deploy/examples/README.md`](./deploy/examples/README.md) for the mechanism
 (why `sparse=1` is not immunity) and how the metric maps to AWS NMA's

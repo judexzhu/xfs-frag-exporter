@@ -18,12 +18,13 @@
 #   3. keep creating small (empty) files; once existing inode clusters fill, each
 #      new one needs 2 contiguous blocks -> none exist -> ENOSPC with free space.
 #
-# HONEST STATUS: the danger GEOMETRY (phase 2) and the exporter's detection of it
-# are verified (see reproducer.yaml). Whether phase 3 reaches creat() ENOSPC
-# depends on exact inode-cluster sizing and fill completeness; treat it as
-# best-effort. If it fills to true block-exhaustion (df 100%) instead of ENOSPC-
-# with-free-space, raise FS_GB or make the fragmentation finer. The tool's job is
-# catching the phase-2 precursor, not needing the crash.
+# VERIFIED (2026-08-21, sparse=1 loopback): creat() failed with ENOSPC after
+# 73,149 files while df showed 407M/960M (42%) FREE and df -i showed 445,504
+# (84%) inodes FREE; freesp -s: 113,886 free extents, average 1.00003 blocks.
+# The exporter read xfs_free_extent_avg_bytes=4096 (density 262137) at that
+# moment -- exact match to freesp -s, far past the 64 KiB XFSSmallAverageExtent
+# floor. That is RHEL-82924 reproduced on the real ROSA HCP geometry.
+# If a rerun fills to true block-exhaustion (df 100%) instead, raise FS_GB.
 #
 # Requires the 'privileged' SCC (loop + mount). Throwaway/test node only.
 #
@@ -92,7 +93,9 @@ spec:
           mkdir -p /mnt/x && mount "$LOOP" /mnt/x
           echo "== geometry =="; xfs_info /mnt/x | grep -E 'isize|imaxpct|spinodes'
 
-          HOST_ROOT=/mnt/x LISTEN_ADDR=:9101 NODE_NAME=repro /exporter >/tmp/exp.log 2>&1 &
+          # short SCRAPE_INTERVAL so the exporter re-walks during the run and its
+          # metrics reflect the fragmented state (default 300s would stay stale).
+          HOST_ROOT=/mnt/x LISTEN_ADDR=:9101 NODE_NAME=repro SCRAPE_INTERVAL=5s /exporter >/tmp/exp.log 2>&1 &
 
           echo "== Phase 1: fill filesystem to 100% =="
           i=0; while fallocate -l 32M "/mnt/x/fill_$i" 2>/dev/null; do i=$((i+1)); done
@@ -110,7 +113,7 @@ spec:
           df -h /mnt/x | tail -1
 
           echo "== exporter view of the fragmented fs =="
-          sleep 6
+          sleep 8   # > SCRAPE_INTERVAL, so this reflects the post-fragmentation walk
           wget -qO- localhost:9101/metrics | grep -E '^xfs_(free_extent_avg|frag_density|free_extent_max|free_bytes|free_extents)' || true
 
           echo "== Phase 3: keep creating small files until ENOSPC (the RHEL-82924 bug) =="
@@ -124,7 +127,8 @@ spec:
           echo "-- df -h (free space still present == the bug):"; df -h /mnt/x | tail -1
           echo "-- df -i (inodes look fine):"; df -i /mnt/x | tail -1
           echo "-- freesp -s:"; xfs_spaceman -c 'freesp -s' /mnt/x || true
-          echo "== exporter at the ENOSPC moment =="
+          echo "== exporter at the ENOSPC moment (avg free extent should be ~4 KiB) =="
+          sleep 8   # ensure a fresh walk after phase 3
           wget -qO- localhost:9101/metrics | grep -E '^xfs_(free_extent_avg|frag_density|free_bytes)' || true
           echo "== DONE; holding =="
           exec sleep infinity

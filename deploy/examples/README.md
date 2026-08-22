@@ -7,7 +7,7 @@ Jira **RFE-9762**), and prove `xfs-frag-exporter` detects it.
 | File | Goal | Verified? |
 |---|---|---|
 | [`reproducer.yaml`](./reproducer.yaml) | Prove **detection** — drive avg free extent below the danger floor and show the exporter reports it, matching `xfs_spaceman` | **Yes** (live) |
-| [`reproducer-enospc.yaml`](./reproducer-enospc.yaml) | Attempt the actual **`creat()` ENOSPC** on `sparse=1`, mimicking Fluent Bit small-file churn | Mechanism sound; crash step is best-effort |
+| [`reproducer-enospc.yaml`](./reproducer-enospc.yaml) | The actual **`creat()` ENOSPC with free space** on `sparse=1`, mimicking Fluent Bit small-file churn | **Yes** (live) |
 
 ## The concept
 
@@ -95,9 +95,23 @@ oc delete ns xfs-repro
 
 Knobs (pod `env`): `FS_GB` sizes the loopback filesystem.
 
-> Honest scope: `reproducer.yaml` (detection) is verified end-to-end. In
-> `reproducer-enospc.yaml`, phase 2 (the danger geometry) and the exporter's
-> detection of it are the point and are reliable; whether phase 3 reaches
-> `creat()` ENOSPC vs plain block-exhaustion depends on inode-cluster sizing and
-> fill completeness — raise `FS_GB` or fragment finer if it fills instead. The
-> tool's value is catching the phase-2 precursor before the node goes bad.
+### Verified result (sparse=1 loopback)
+
+`reproducer-enospc.yaml`, run to completion:
+
+```
+creat() failed: /mnt/x/churn/f_73149: No space left on device
+df -h:  /dev/loop2  960M  554M  407M  58%     <- 42% of blocks FREE
+df -i:  /dev/loop2  524288 78784 445504 16%   <- 84% of inodes FREE
+freesp -s: 113,886 free extents, average 1.00003 blocks
+exporter:  xfs_free_extent_avg_bytes = 4096   (density 262137)  <- matches freesp -s
+```
+
+ENOSPC with 42% of blocks and 84% of inodes free — pure free-space fragmentation
+on `sparse=1`. Exactly RHEL-82924. The exporter's `xfs_free_extent_avg_bytes`
+tracked the ground truth to the block and sat far below the 64 KiB alert floor.
+
+> Note: why it must PUNCH, not delete — `rm` frees the inode slot too, so plain
+> create/delete churn recycles inodes and slides into ordinary "disk full"
+> instead. Freeing data while keeping the inode (truncate/punch, as log rotation
+> does) is what strands the inodes and forces the failing new-cluster allocation.
