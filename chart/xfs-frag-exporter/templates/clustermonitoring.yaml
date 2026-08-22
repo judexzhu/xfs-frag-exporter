@@ -1,0 +1,54 @@
+{{- if .Values.clusterMonitoring.enabled }}
+# Let the platform prometheus-k8s (openshift-monitoring) scrape this namespace
+# without UWM — the node-problem-detector pattern (KCS 7024333 / 7124720). Pairs
+# with the openshift.io/cluster-monitoring label on the namespace and the
+# ServiceMonitor.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prometheus-k8s
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "xfs-frag-exporter.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prometheus-k8s
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "xfs-frag-exporter.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prometheus-k8s
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-k8s
+    namespace: openshift-monitoring
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-scrape
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "xfs-frag-exporter.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "xfs-frag-exporter.selectorLabels" . | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-monitoring
+      ports:
+        - port: {{ .Values.listenPort }}
+          protocol: TCP
+{{- end }}

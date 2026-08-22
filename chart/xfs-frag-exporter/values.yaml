@@ -54,6 +54,13 @@ serviceMonitor:
   enabled: false
   interval: 300s
 
+# Scrape via the built-in OpenShift cluster monitoring (prometheus-k8s) instead
+# of UWM — the node-problem-detector pattern (KCS 7024333). Adds the
+# prometheus-k8s RBAC + a NetworkPolicy and labels the namespace for
+# cluster-monitoring. Implies a ServiceMonitor. OpenShift only.
+clusterMonitoring:
+  enabled: false
+
 # Alert rules. Thresholds are HEURISTIC — calibrate against your fleet.
 prometheusRule:
   enabled: false

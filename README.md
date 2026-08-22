@@ -95,10 +95,14 @@ All knobs are in [`chart/xfs-frag-exporter/values.yaml`](./chart/xfs-frag-export
 - **No Prometheus Operator / no UWM:** the pods carry `prometheus.io/scrape`
   annotations, or point a static Prometheus job at the headless Service
   (`xfs-frag-exporter.xfs-frag-exporter:9101`).
-- **Prometheus Operator / OpenShift UWM:** also apply
-  `deploy/servicemonitor.yaml` and `deploy/prometheusrule.yaml`. On OpenShift,
-  enable UWM (`enableUserWorkload: true` in `cluster-monitoring-config`) and grant
-  yourself `monitoring-edit` + `monitoring-rules-edit` in the namespace.
+- **OpenShift cluster monitoring (no UWM):** `--set clusterMonitoring.enabled=true`.
+  The built-in platform `prometheus-k8s` scrapes the namespace directly, using the
+  node-problem-detector pattern (KCS 7024333): a `prometheus-k8s` Role/RoleBinding,
+  a NetworkPolicy allowing `openshift-monitoring` ingress, and the
+  `openshift.io/cluster-monitoring: "true"` namespace label. No UWM stack needed.
+- **Prometheus Operator / OpenShift UWM:** enable UWM
+  (`enableUserWorkload: true` in `cluster-monitoring-config`), grant yourself
+  `monitoring-edit` + `monitoring-rules-edit`, then `--set serviceMonitor.enabled=true`.
 
 ## Configuration (env)
 

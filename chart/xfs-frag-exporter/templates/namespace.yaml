@@ -5,6 +5,10 @@ metadata:
   name: {{ .Values.namespace }}
   labels:
     {{- include "xfs-frag-exporter.labels" . | nindent 4 }}
+    {{- if .Values.clusterMonitoring.enabled }}
+    # Let the platform prometheus-k8s scrape this namespace (no UWM needed).
+    openshift.io/cluster-monitoring: "true"
+    {{- end }}
     # hostPath requires the 'privileged' Pod Security level even though the
     # container runs unprivileged/non-root.
     pod-security.kubernetes.io/enforce: privileged
