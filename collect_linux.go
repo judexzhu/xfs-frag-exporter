@@ -52,13 +52,26 @@ const (
 	recSize  = int(unsafe.Sizeof(fsmap{}))     // 64
 )
 
-// collectFreeExtents issues GETFSMAP against a mounted XFS path and returns the
-// byte length of every free extent. It walks the whole device in batches,
-// advancing the low key past the last record each round until FMR_OF_LAST.
-func collectFreeExtents(path string) ([]uint64, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", path, err)
+// collectFreeExtents issues GETFSMAP against an XFS filesystem and returns the
+// byte length of every free extent. GETFSMAP reports the whole filesystem
+// regardless of which mount is opened, so it tries the candidate paths (all bind
+// mounts of the same device) and uses the first that opens — some host mounts
+// (e.g. /var) may be unreadable to the container under SELinux while another
+// (e.g. /etc) is fine. It walks the device in batches, advancing the low key
+// past the last record each round until FMR_OF_LAST.
+func collectFreeExtents(paths []string) ([]uint64, error) {
+	fd, path := -1, ""
+	var openErr error
+	for _, p := range paths {
+		f, err := syscall.Open(p, syscall.O_RDONLY, 0)
+		if err == nil {
+			fd, path = f, p
+			break
+		}
+		openErr = err
+	}
+	if fd < 0 {
+		return nil, fmt.Errorf("open (tried %v): %w", paths, openErr)
 	}
 	defer syscall.Close(fd)
 
@@ -115,9 +128,9 @@ func collectFreeExtents(path string) ([]uint64, error) {
 
 // xfsMount is one discovered XFS filesystem.
 type xfsMount struct {
-	mountpoint string // host-absolute path; used as the metric label
-	device     string // backing device; used as the metric label
-	openPath   string // path to open from inside the container (hostRoot + mountpoint)
+	mountpoint string   // host-absolute path; used as the metric label
+	device     string   // backing device; used as the metric label
+	openPaths  []string // candidate paths to open; any works (GETFSMAP is whole-fs)
 }
 
 // discoverXFSMounts returns one entry per host XFS filesystem. With the node
@@ -134,7 +147,10 @@ func discoverXFSMounts(hostRoot string) ([]xfsMount, error) {
 	}
 	defer f.Close()
 
-	best := map[string]xfsMount{} // maj:min -> preferred mount for that filesystem
+	// One entry per filesystem (maj:min): the same XFS is bind-mounted at many
+	// paths, all reporting the same free space. Collect every path as an open
+	// candidate and keep the best label.
+	byDev := map[string]*xfsMount{}
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		// mountinfo: "<id> <pid> <maj:min> <root> <mountpoint> ... - <fstype> <source> <opts>"
@@ -158,24 +174,24 @@ func discoverXFSMounts(hostRoot string) ([]xfsMount, error) {
 		if label == "" {
 			label = "/"
 		}
-		m := xfsMount{
-			mountpoint: label, // host-absolute path
-			device:     unescapeMountinfo(right[1]),
-			openPath:   openPath, // already under hostRoot
-		}
-		// One entry per filesystem (maj:min): the same XFS is bind-mounted at
-		// many paths, all reporting the same free space. Keep the best label.
 		majmin := left[2]
-		if cur, ok := best[majmin]; !ok || preferLabel(m.mountpoint, cur.mountpoint) {
-			best[majmin] = m
+		m := byDev[majmin]
+		if m == nil {
+			m = &xfsMount{device: unescapeMountinfo(right[1])}
+			byDev[majmin] = m
+		}
+		m.openPaths = append(m.openPaths, openPath)
+		if m.mountpoint == "" || preferLabel(label, m.mountpoint) {
+			m.mountpoint = label
 		}
 	}
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
-	mounts := make([]xfsMount, 0, len(best))
-	for _, m := range best {
-		mounts = append(mounts, m)
+	mounts := make([]xfsMount, 0, len(byDev))
+	for _, m := range byDev {
+		sort.Strings(m.openPaths) // stable, and shorter/likelier-readable paths first
+		mounts = append(mounts, *m)
 	}
 	sort.Slice(mounts, func(i, j int) bool { return mounts[i].mountpoint < mounts[j].mountpoint })
 	return mounts, nil

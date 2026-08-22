@@ -70,10 +70,10 @@ func (c *collector) refresh() {
 	results := make([]mountResult, 0, len(mounts))
 	for _, m := range mounts {
 		start := time.Now()
-		ext, err := collectFreeExtents(m.openPath)
+		ext, err := collectFreeExtents(m.openPaths)
 		r := mountResult{mount: m, duration: time.Since(start).Seconds()}
 		if err != nil {
-			log.Printf("collect %s: %v", m.openPath, err)
+			log.Printf("collect %s: %v", m.mountpoint, err)
 		} else {
 			r.stats = frag.Aggregate(ext)
 			r.success = true
