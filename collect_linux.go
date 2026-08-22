@@ -19,8 +19,12 @@ const (
 	fsIocGetFsMap     = 0xc0c0583b
 	fmrOfSpecialOwner = 0x10
 	fmrOfLast         = 0x20
-	fmrOwnFree        = uint64('X')<<32 | 1 // FMR_OWNER('X', 1) = 0x5800000001
-	recsPerCall       = 512
+	// FMR_OWN_FREE. The docs define it as FMR_OWNER('X',1) = 0x5800000001, but the
+	// running kernel reports the bare code (0x1). Match the low 32 bits so both
+	// encodings work.
+	fmrOwnFreeCode = 1
+	ownerCodeMask  = 0xffffffff
+	recsPerCall    = 512
 )
 
 type fsmap struct {
@@ -92,7 +96,7 @@ func collectFreeExtents(path string) ([]uint64, error) {
 				sampleFlags, sampleOwner = r.Flags, r.Owner
 			}
 			raw++
-			if r.Flags&fmrOfSpecialOwner != 0 && r.Owner == fmrOwnFree {
+			if r.Flags&fmrOfSpecialOwner != 0 && r.Owner&ownerCodeMask == fmrOwnFreeCode {
 				out = append(out, r.Length)
 			}
 		}
