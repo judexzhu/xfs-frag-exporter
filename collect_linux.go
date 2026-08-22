@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -133,8 +134,7 @@ func discoverXFSMounts(hostRoot string) ([]xfsMount, error) {
 	}
 	defer f.Close()
 
-	var mounts []xfsMount
-	seenDev := map[string]bool{}
+	best := map[string]xfsMount{} // maj:min -> preferred mount for that filesystem
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
 		// mountinfo: "<id> <pid> <maj:min> <root> <mountpoint> ... - <fstype> <source> <opts>"
@@ -154,23 +154,41 @@ func discoverXFSMounts(hostRoot string) ([]xfsMount, error) {
 		if openPath != hostRoot && !strings.HasPrefix(openPath, hostRoot+"/") {
 			continue
 		}
-		majmin := left[2]
-		if seenDev[majmin] {
-			continue // same filesystem, same free space
-		}
-		seenDev[majmin] = true
-
 		label := strings.TrimPrefix(openPath, hostRoot)
 		if label == "" {
 			label = "/"
 		}
-		mounts = append(mounts, xfsMount{
+		m := xfsMount{
 			mountpoint: label, // host-absolute path
 			device:     unescapeMountinfo(right[1]),
 			openPath:   openPath, // already under hostRoot
-		})
+		}
+		// One entry per filesystem (maj:min): the same XFS is bind-mounted at
+		// many paths, all reporting the same free space. Keep the best label.
+		majmin := left[2]
+		if cur, ok := best[majmin]; !ok || preferLabel(m.mountpoint, cur.mountpoint) {
+			best[majmin] = m
+		}
 	}
-	return mounts, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	mounts := make([]xfsMount, 0, len(best))
+	for _, m := range best {
+		mounts = append(mounts, m)
+	}
+	sort.Slice(mounts, func(i, j int) bool { return mounts[i].mountpoint < mounts[j].mountpoint })
+	return mounts, nil
+}
+
+// preferLabel reports whether label a is a better representative than b for the
+// same filesystem (one XFS is bind-mounted at many paths): "/var" wins — it's
+// where container churn lands — then the shorter path.
+func preferLabel(a, b string) bool {
+	if (a == "/var") != (b == "/var") {
+		return a == "/var"
+	}
+	return len(a) < len(b)
 }
 
 // unescapeMountinfo decodes the octal escapes the kernel uses in mountinfo for

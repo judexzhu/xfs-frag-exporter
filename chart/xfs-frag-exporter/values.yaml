@@ -5,7 +5,7 @@ namespaceCreate: true
 
 image:
   repository: ghcr.io/judexzhu/xfs-frag-exporter
-  tag: latest
+  tag: v0.1.0
   pullPolicy: IfNotPresent
 
 # Collection tuning.
