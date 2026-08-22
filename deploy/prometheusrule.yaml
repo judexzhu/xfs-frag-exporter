@@ -33,9 +33,17 @@ spec:
   groups:
     - name: xfs-frag.rules
       rules:
-        # The sick-node signal: rate of fragmentation growth, per day.
+        # Step 1: collapse pod/instance churn to ONE stable series per filesystem.
+        # Every exporter pod reports the same free space, and each pod lifetime is a
+        # separate series (rollouts + restarts) — max by(node,mountpoint,device)
+        # dedupes them into a single series whose identity survives pod restarts.
+        - record: node:xfs_frag_density:max
+          expr: max by (node, mountpoint, device) (xfs_frag_density_extents_per_gib)
+        # Step 2: rate of fragmentation growth per day, off the STABLE series. Because
+        # step 1 is continuous across restarts, deriv[24h] fits a real 24h trend
+        # instead of a short post-restart fragment (the old false-positive source).
         - record: node:xfs_frag_density:rate1d
-          expr: deriv(xfs_frag_density_extents_per_gib[24h]) * 86400
+          expr: deriv(node:xfs_frag_density:max[24h]) * 86400
 
     - name: xfs-frag.alerts
       rules:
@@ -70,8 +78,11 @@ spec:
               file creation may ENOSPC with free space left (RHEL-82924). Drain and
               replace the node; in-place xfs_fsr needs an unmount.
 
-        # SECONDARY / INFO ONLY: rate of fragmentation. Rate-based PromQL
-        # false-positives across clusters and needs ~26h history — do not page.
+        # SECONDARY / INFO: trend, not a page. Now off the aggregated per-fs series
+        # (node:xfs_frag_density:max), so it is one series per filesystem and stable
+        # across pod restarts — no more label spam or post-restart false positives.
+        # Still a trend signal that needs ~24h history; use it to spot a node that is
+        # fragmenting FAST, and confirm severity with the level signals.
         - alert: XFSFragmentationRising
           expr: node:xfs_frag_density:rate1d > 1.05
           for: 2h
@@ -81,8 +92,8 @@ spec:
             summary: "XFS fragmenting fast on {{ $labels.node }} {{ $labels.mountpoint }}"
             description: >-
               frag_density rising {{ $value | printf "%.2f" }} extents/GiB/day for 2h.
-              Weak signal (rate-based, false-positive prone); confirm with
-              xfs_free_extent_avg_bytes.
+              Trend signal — confirm severity with xfs_free_extents_small /
+              xfs_free_extents and xfs_free_extent_avg_bytes.
 
         # APPROACHING DEAD: largest free extent collapsing vs the AG ceiling.
         - alert: XFSLowContiguity

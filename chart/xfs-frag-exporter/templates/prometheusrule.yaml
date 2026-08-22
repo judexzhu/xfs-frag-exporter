@@ -11,8 +11,12 @@ spec:
   groups:
     - name: xfs-frag.rules
       rules:
+        # Step 1: dedupe pod/instance churn to one stable series per filesystem.
+        - record: node:xfs_frag_density:max
+          expr: max by (node, mountpoint, device) (xfs_frag_density_extents_per_gib)
+        # Step 2: per-day rate off the stable series (continuous across pod restarts).
         - record: node:xfs_frag_density:rate1d
-          expr: deriv(xfs_frag_density_extents_per_gib[24h]) * 86400
+          expr: deriv(node:xfs_frag_density:max[24h]) * 86400
     - name: xfs-frag.alerts
       rules:
         # PRIMARY (RHEL-82924): fraction of free extents under 64 KiB. Count-based,
@@ -36,7 +40,8 @@ spec:
           annotations:
             summary: {{ `"XFS free space critically fragmented on {{ $labels.node }} {{ $labels.mountpoint }}"` }}
             description: {{ `"avg free extent {{ $value | printf \"%.0f\" }} B (< 64 KiB); creat() may ENOSPC with free space left (RHEL-82924). Drain and replace the node."` }}
-        # SECONDARY / INFO ONLY: rate-based, false-positive prone. Do not page.
+        # SECONDARY / INFO: trend off the aggregated per-fs series (stable across pod
+        # restarts). Confirm severity with the level signals; do not page.
         - alert: XFSFragmentationRising
           expr: node:xfs_frag_density:rate1d > {{ .Values.prometheusRule.fragRatePerDay }}
           for: 2h
