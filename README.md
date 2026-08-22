@@ -179,6 +179,22 @@ blocked, `privileged: true`. On OpenShift, granting `privileged` needs
 cluster-admin (`oc adm policy add-scc-to-user privileged -z xfs-frag-exporter -n
 xfs-frag-exporter`).
 
+## Reproducing & validating
+
+[`deploy/examples/`](./deploy/examples) has two reproducers (and a walkthrough of
+the concept) that recreate the RHEL-82924 free-space-fragmentation bug on an
+isolated loopback XFS and prove the exporter detects it:
+
+- `reproducer.yaml` — **verified**: fragments a `sparse=1` fs to ~1-block avg and
+  shows `xfs_free_extent_avg_bytes` matching `xfs_spaceman freesp -s` exactly
+  (4706 B ≡ 1.149 blocks), well past the 64 KiB alert floor.
+- `reproducer-enospc.yaml` — mimics Fluent Bit small-file churn to attempt the
+  actual `creat()` ENOSPC-with-free-space on `sparse=1`.
+
+See [`deploy/examples/README.md`](./deploy/examples/README.md) for the mechanism
+(why `sparse=1` is not immunity) and how the metric maps to AWS NMA's
+`XFSSmallAverageClusterSize`.
+
 ## Development
 
 ```sh
@@ -188,7 +204,8 @@ GOOS=linux go build ./...             # the ioctl/collection code is Linux-only
 
 ## Not yet implemented (phase 1.5)
 
-Free-extent size-distribution buckets, `xfs_avg_free_extent_bytes`, `statfs`
-capacity/inode metrics, and `FSGEOMETRY` config metrics (`sparse`, `imaxpct`,
-`agsize` — which would let `XFSLowContiguity` use a real `agsize` metric instead
-of the hardcoded fleet constant).
+Free-extent size-distribution buckets, `statfs` capacity metrics (inode counts
+are already covered by node_exporter's `node_filesystem_files_free`), and
+`FSGEOMETRY` config metrics (`sparse`, `imaxpct`, `agsize` — which would let
+`XFSLowContiguity` use a real `agsize` metric instead of the hardcoded fleet
+constant).

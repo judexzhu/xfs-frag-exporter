@@ -1,0 +1,141 @@
+# XFS ENOSPC-with-free-space reproducer (RHEL-82924) — the sparse=1 mechanism.
+#
+# Unlike reproducer.yaml (which proves DETECTION), this one attempts to trigger
+# the actual creat() ENOSPC on the real ROSA HCP geometry (sparse=1) by mimicking
+# the accelerated worst case of Fluent Bit's small-file churn.
+#
+# Mechanism it exploits:
+#   Sparse inodes lower inode allocation from a full 64-inode chunk (8 contiguous
+#   blocks) to ONE inode cluster = 2 contiguous blocks (8 KiB at 512 B inodes).
+#   So if free space is fragmented to ISOLATED single 4 KiB blocks with no 2-block
+#   run anywhere, a new inode cluster cannot be allocated -> creat() ENOSPC while
+#   free single blocks remain. This is why sparse=1 is NOT immunity.
+#
+# Phases:
+#   1. fill the fs to true 100%
+#   2. free every OTHER block of every fill file -> all free space becomes
+#      isolated 4 KiB blocks (freesp -s: everything in the "1 1" bucket)
+#   3. keep creating small (empty) files; once existing inode clusters fill, each
+#      new one needs 2 contiguous blocks -> none exist -> ENOSPC with free space.
+#
+# HONEST STATUS: the danger GEOMETRY (phase 2) and the exporter's detection of it
+# are verified (see reproducer.yaml). Whether phase 3 reaches creat() ENOSPC
+# depends on exact inode-cluster sizing and fill completeness; treat it as
+# best-effort. If it fills to true block-exhaustion (df 100%) instead of ENOSPC-
+# with-free-space, raise FS_GB or make the fragmentation finer. The tool's job is
+# catching the phase-2 precursor, not needing the crash.
+#
+# Requires the 'privileged' SCC (loop + mount). Throwaway/test node only.
+#
+# Deploy:   oc apply -f deploy/examples/reproducer-enospc.yaml
+# Watch:    oc -n xfs-repro logs -f xfs-enospc
+# Clean up: oc -n xfs-repro exec xfs-enospc -- sh -c 'umount /mnt/x; losetup -D' ; oc delete ns xfs-repro
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: xfs-repro
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fragmenter
+  namespace: xfs-repro
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fragmenter-privileged
+  namespace: xfs-repro
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+  - kind: ServiceAccount
+    name: fragmenter
+    namespace: xfs-repro
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: xfs-enospc
+  namespace: xfs-repro
+  labels: { app: xfs-enospc }
+spec:
+  serviceAccountName: fragmenter
+  restartPolicy: Never
+  containers:
+    - name: repro
+      image: golang:1.23
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -eu
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq && apt-get install -y -qq xfsprogs util-linux wget >/dev/null
+          cd /tmp && git clone --depth 1 https://github.com/judexzhu/xfs-frag-exporter >/dev/null 2>&1
+          cd xfs-frag-exporter && CGO_ENABLED=0 go build -o /exporter . && echo "exporter $(git rev-parse --short HEAD)"
+
+          IMG=/work/xfs.img; FS_GB=${FS_GB:-1}
+          truncate -s ${FS_GB}G "$IMG"
+          mkfs.xfs -q -f "$IMG"                       # DEFAULT sparse=1 = real ROSA HCP geometry
+          modprobe loop 2>/dev/null || true
+          [ -e /dev/loop-control ] || mknod /dev/loop-control c 10 237
+          if ! LOOP=$(losetup --find --show "$IMG" 2>/dev/null); then
+            for i in $(seq 0 15); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 "$i"; done
+            LOOP=$(losetup --find --show "$IMG")
+          fi
+          mkdir -p /mnt/x && mount "$LOOP" /mnt/x
+          echo "== geometry =="; xfs_info /mnt/x | grep -E 'isize|imaxpct|spinodes'
+
+          HOST_ROOT=/mnt/x LISTEN_ADDR=:9101 NODE_NAME=repro /exporter >/tmp/exp.log 2>&1 &
+
+          echo "== Phase 1: fill filesystem to 100% =="
+          i=0; while fallocate -l 32M "/mnt/x/fill_$i" 2>/dev/null; do i=$((i+1)); done
+          j=0; while dd if=/dev/zero of="/mnt/x/top_$j" bs=4096 count=1 2>/dev/null; do j=$((j+1)); done
+          echo "filled ${i}x32M + ${j}x4K; df:"; df -h /mnt/x | tail -1
+
+          echo "== Phase 2: fragment ALL free space to isolated 4 KiB blocks (no 2-block run) =="
+          for f in /mnt/x/fill_*; do
+            sz=$(stat -c %s "$f")
+            awk -v fs="$sz" 'BEGIN{for(o=0;o+4096<=fs;o+=8192)printf "fpunch %d 4096\n",o;print "quit"}' | xfs_io "$f"
+          done
+          sync
+          echo "freesp -s (expect ~all in the '1 1' bucket, no runs >=2):"
+          xfs_spaceman -c 'freesp -s' /mnt/x || true
+          df -h /mnt/x | tail -1
+
+          echo "== exporter view of the fragmented fs =="
+          sleep 6
+          wget -qO- localhost:9101/metrics | grep -E '^xfs_(free_extent_avg|frag_density|free_extent_max|free_bytes|free_extents)' || true
+
+          echo "== Phase 3: keep creating small files until ENOSPC (the RHEL-82924 bug) =="
+          mkdir -p /mnt/x/churn
+          n=0
+          while : > "/mnt/x/churn/f_$n" 2>/tmp/e; do
+            n=$((n+1))
+            [ $((n%2000)) -eq 0 ] && echo "  created $n empty files; avail=$(df -h --output=avail /mnt/x | tail -1)"
+          done
+          echo "!! creat() FAILED after $n files:"; cat /tmp/e
+          echo "-- df -h (free space still present == the bug):"; df -h /mnt/x | tail -1
+          echo "-- df -i (inodes look fine):"; df -i /mnt/x | tail -1
+          echo "-- freesp -s:"; xfs_spaceman -c 'freesp -s' /mnt/x || true
+          echo "== exporter at the ENOSPC moment =="
+          wget -qO- localhost:9101/metrics | grep -E '^xfs_(free_extent_avg|frag_density|free_bytes)' || true
+          echo "== DONE; holding =="
+          exec sleep infinity
+      env:
+        - { name: FS_GB, value: "1" }
+      securityContext:
+        privileged: true
+        runAsUser: 0
+      volumeMounts:
+        - { name: work, mountPath: /work }
+  volumes:
+    - name: work
+      emptyDir:
+        sizeLimit: 3Gi
