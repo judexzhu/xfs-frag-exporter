@@ -49,6 +49,7 @@ func main() {
 type mountResult struct {
 	mount    xfsMount
 	stats    frag.Stats
+	geom     XFSGeometry
 	duration float64 // seconds spent in the GETFSMAP walk
 	success  bool
 }
@@ -77,6 +78,11 @@ func (c *collector) refresh() {
 		} else {
 			r.stats = frag.Aggregate(ext)
 			r.success = true
+		}
+		if geom, err := collectGeometry(m.openPaths); err != nil {
+			log.Printf("geometry %s: %v", m.mountpoint, err)
+		} else {
+			r.geom = geom
 		}
 		results = append(results, r)
 	}
@@ -108,6 +114,10 @@ func writeExposition(w io.Writer, node string, snap []mountResult) {
 		"Free extents smaller than 64 KiB (16 blocks). As a fraction of xfs_free_extents this is the field-validated RHEL-82924 signal (live-incident nodes: 95-98%); it catches heavy-tail fragmentation the byte-mean xfs_free_extent_avg_bytes misses.",
 		node, snap, func(r mountResult) (float64, bool) { return float64(r.stats.SmallExtents), r.success })
 
+	gauge(w, "xfs_free_extents_tiny",
+		"Free extents smaller than 8 KiB (2 blocks). These cannot satisfy even a sparse inode cluster allocation (sparse=1 needs 2 contiguous blocks). When this approaches xfs_free_extents, creat() ENOSPC is imminent regardless of sparse inode support.",
+		node, snap, func(r mountResult) (float64, bool) { return float64(r.stats.TinyExtents), r.success })
+
 	gauge(w, "xfs_frag_density_extents_per_gib",
 		"Free extents per GiB of free space; the exact reciprocal of avg extent size (2^30/avg).",
 		node, snap, func(r mountResult) (float64, bool) { return r.stats.Density(), r.success })
@@ -123,6 +133,18 @@ func writeExposition(w io.Writer, node string, snap []mountResult) {
 	gauge(w, "xfs_free_bytes",
 		"Total free space in bytes (sum of free extents).",
 		node, snap, func(r mountResult) (float64, bool) { return float64(r.stats.FreeBytes), r.success })
+
+	gauge(w, "xfs_free_extents_tiny",
+		"Free extents smaller than 8 KiB (2 blocks). Cannot satisfy even a sparse inode cluster allocation. When this approaches xfs_free_extents, creat() ENOSPC is imminent regardless of sparse inode support.",
+		node, snap, func(r mountResult) (float64, bool) { return float64(r.stats.TinyExtents), r.success })
+
+	gauge(w, "xfs_agsize_bytes",
+		"Allocation group size in bytes (from XFS_IOC_FSGEOMETRY). The hard ceiling on any single free extent; used to evaluate xfs_free_extent_max_bytes.",
+		node, snap, func(r mountResult) (float64, bool) { return float64(r.geom.AGSizeBytes()), r.geom.Valid() })
+
+	gauge(w, "xfs_sparse_inodes_enabled",
+		"1 if sparse inodes are enabled (sparse=1), 0 if not. sparse=1 lowers inode chunk allocation from 8 to 2 contiguous blocks but does NOT prevent ENOSPC under severe fragmentation.",
+		node, snap, func(r mountResult) (float64, bool) { return b2f(r.geom.SparseInodes()), r.geom.Valid() })
 
 	gauge(w, "xfs_freesp_scrape_duration_seconds",
 		"Seconds spent in the GETFSMAP walk.",

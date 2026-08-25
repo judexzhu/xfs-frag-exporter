@@ -43,9 +43,9 @@ spec:
           resources:
             requests:
               cpu: 10m
-              memory: 32Mi
-            limits:
               memory: 64Mi
+            limits:
+              memory: 256Mi
           # Least-privilege: no privileged, no added capabilities, non-root, RO
           # root fs. GETFSMAP needs none of them for free space. If a node's
           # SELinux/permissions block opening the host mount, see README ("If

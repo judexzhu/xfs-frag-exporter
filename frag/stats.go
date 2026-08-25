@@ -12,12 +12,19 @@ const bytesPerGiB = 1 << 30
 // multiples, so "< 65536" means "<= 60 KiB" — the customer's freesp-s bucket.
 const smallExtentBytes = 16 * 4096 // 65536
 
+// tinyExtentBytes is the sparse=1 critical threshold: 2 blocks (8 KiB). A free
+// extent below this cannot satisfy even a sparse inode cluster allocation (which
+// needs 2 contiguous blocks). When most free extents are below this, creat()
+// will ENOSPC regardless of sparse inode support.
+const tinyExtentBytes = 2 * 4096 // 8192
+
 // Stats summarises a filesystem's free extents.
 type Stats struct {
 	Extents      uint64 // number of free extents
 	FreeBytes    uint64 // total free space (sum of extent lengths)
 	MaxBytes     uint64 // largest single free extent
 	SmallExtents uint64 // free extents smaller than 16 blocks (64 KiB)
+	TinyExtents  uint64 // free extents smaller than 2 blocks (8 KiB) — can't fit sparse inode cluster
 }
 
 // Aggregate reduces free-extent byte lengths to summary stats.
@@ -31,6 +38,9 @@ func Aggregate(extentBytes []uint64) Stats {
 		}
 		if n < smallExtentBytes {
 			s.SmallExtents++
+		}
+		if n < tinyExtentBytes {
+			s.TinyExtents++
 		}
 	}
 	return s

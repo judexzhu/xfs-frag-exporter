@@ -19,9 +19,7 @@
 #   - 0.90 = fraction of free extents under 64 KiB; incident nodes were 0.95-0.98.
 #   - 65536 B = 16 blocks: the EKS/RHEL-82924 critical avg-free-extent size.
 #   - 0.10 = MAX_EXT as a fraction of an allocation group; healthy ~0.99.
-#   - agsize (1434976256 B = 350336 blks x 4096) is hardcoded as a homogeneous-
-#     fleet constant. Replace with the xfs_agsize_bytes metric once FSGEOMETRY
-#     collection ships (phase 1.5).
+#   - agsize now comes from the xfs_agsize_bytes metric (FSGEOMETRY ioctl).
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -97,7 +95,7 @@ spec:
 
         # APPROACHING DEAD: largest free extent collapsing vs the AG ceiling.
         - alert: XFSLowContiguity
-          expr: xfs_free_extent_max_bytes / 1434976256 < 0.10
+          expr: xfs_free_extent_max_bytes / xfs_agsize_bytes < 0.10
           for: 30m
           labels:
             severity: warning
@@ -110,7 +108,7 @@ spec:
         # AGGRAVATING FACTOR: sparse inodes off. sparse=1 does NOT make a node
         # immune to fragmentation ENOSPC (RHEL-82924 hits sparse=1 nodes too), but
         # sparse=0 lowers the bar further by requiring a full contiguous inode
-        # chunk. Requires the phase-1.5 FSGEOMETRY metric; never fires until then.
+        # chunk (8 blocks vs 2 blocks).
         - alert: XFSSparseInodesDisabled
           expr: xfs_sparse_inodes_enabled == 0
           for: 1h

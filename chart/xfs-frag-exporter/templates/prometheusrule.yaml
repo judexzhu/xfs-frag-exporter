@@ -52,13 +52,13 @@ spec:
             description: {{ `"frag_density rising {{ $value | printf \"%.2f\" }} extents/GiB/day for 2h (weak signal; confirm with xfs_free_extent_avg_bytes)."` }}
         # APPROACHING DEAD: largest free extent collapsing vs the AG ceiling.
         - alert: XFSLowContiguity
-          expr: xfs_free_extent_max_bytes / {{ .Values.prometheusRule.agsizeBytes }} < {{ .Values.prometheusRule.maxExtentRatio }}
+          expr: xfs_free_extent_max_bytes / xfs_agsize_bytes < {{ .Values.prometheusRule.maxExtentRatio }}
           for: 30m
           labels:
             severity: warning
           annotations:
             summary: {{ `"XFS largest free extent low on {{ $labels.node }} {{ $labels.mountpoint }}"` }}
-        # REAL DANGER: sparse inodes off (phase-1.5 metric; harmless until then).
+        # AGGRAVATING: sparse inodes off — needs 8 contiguous blocks vs 2.
         - alert: XFSSparseInodesDisabled
           expr: xfs_sparse_inodes_enabled == 0
           for: 1h

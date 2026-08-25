@@ -51,6 +51,18 @@ func TestSmallExtentsBoundary(t *testing.T) {
 	}
 }
 
+// TestTinyExtentsBoundary pins the "< 2 blocks (8 KiB)" rule for sparse=1:
+// 4 KiB counts as tiny, exactly 8 KiB does not.
+func TestTinyExtentsBoundary(t *testing.T) {
+	s := Aggregate([]uint64{4096, 4096, 8192, 8193, 61440, 1 << 20})
+	if s.TinyExtents != 2 {
+		t.Fatalf("TinyExtents = %d, want 2 (two 4096-byte extents only)", s.TinyExtents)
+	}
+	if s.SmallExtents != 5 {
+		t.Fatalf("SmallExtents = %d, want 5 (4096 + 4096 + 8192 + 8193 + 61440)", s.SmallExtents)
+	}
+}
+
 // TestSmallRatioCatchesHeavyTail reproduces the live-incident node ip-10-26-86-71
 // profile: a few large free extents hold most of the bytes (mean stays ABOVE the
 // 64 KiB floor, so the average-based signal misses it) while the overwhelming

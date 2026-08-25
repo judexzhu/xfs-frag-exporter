@@ -13,13 +13,16 @@ import (
 	"unsafe"
 )
 
-// GETFSMAP ioctl. See docs/adr/0002. Struct layout from include/uapi/linux/fsmap.h,
-// ABI-frozen since Linux 4.12. No CAP_SYS_ADMIN is needed for free space: the
-// kernel selects the unprivileged bnobt backend, which reports FMR_OWN_FREE.
+// XFS ioctls. Struct layouts from linux/fs.h and linux/xfs/xfs_fs.h, ABI-frozen.
+// GETFSMAP (docs/adr/0002): no CAP_SYS_ADMIN needed for free space.
+// FSGEOMETRY: returns filesystem geometry (agcount, agsize, blocksize, flags).
 const (
-	fsIocGetFsMap     = 0xc0c0583b
-	fmrOfSpecialOwner = 0x10
-	fmrOfLast         = 0x20
+	fsIocGetFsMap = 0xc0c0583b
+	// XFS_IOC_FSGEOMETRY_V4 = _IOR('X', 124, struct xfs_fsop_geom_v4)
+	// struct is 112 bytes; must open a mount point, not a block device.
+	xfsIocFsGeometryV4 = (2 << 30) | (112 << 16) | (0x58 << 8) | 124
+	fmrOfSpecialOwner  = 0x10
+	fmrOfLast          = 0x20
 	// FMR_OWN_FREE. The docs define it as FMR_OWNER('X',1) = 0x5800000001, but the
 	// running kernel reports the bare code (0x1). Match the low 32 bits so both
 	// encodings work.
@@ -124,6 +127,58 @@ func collectFreeExtents(paths []string) ([]uint64, error) {
 		log.Printf("GETFSMAP %s: raw=%d free=%d sampleFlags=%#x sampleOwner=%#x", path, raw, len(out), sampleFlags, sampleOwner)
 	}
 	return out, nil
+}
+
+// XFSGeometry holds filesystem geometry from XFS_IOC_FSGEOMETRY_V4.
+type XFSGeometry struct {
+	BlockSize uint32
+	AGBlocks  uint32 // blocks per allocation group
+	AGCount   uint32
+	InodeSize uint32
+	Flags     uint32
+}
+
+const (
+	xfsGeomFlagFinobt  = 0x20000
+	xfsGeomFlagSparse  = 0x40000
+	xfsGeomFlagRmapbt  = 0x80000
+	xfsGeomFlagReflink = 0x100000
+)
+
+func (g XFSGeometry) AGSizeBytes() uint64 { return uint64(g.AGBlocks) * uint64(g.BlockSize) }
+func (g XFSGeometry) SparseInodes() bool  { return g.Flags&xfsGeomFlagSparse != 0 }
+func (g XFSGeometry) Valid() bool         { return g.BlockSize > 0 }
+
+// collectGeometry issues XFS_IOC_FSGEOMETRY_V4 to get filesystem geometry.
+func collectGeometry(paths []string) (XFSGeometry, error) {
+	fd, path := -1, ""
+	var openErr error
+	for _, p := range paths {
+		f, err := syscall.Open(p, syscall.O_RDONLY, 0)
+		if err == nil {
+			fd, path = f, p
+			break
+		}
+		openErr = err
+	}
+	if fd < 0 {
+		return XFSGeometry{}, fmt.Errorf("open (tried %v): %w", paths, openErr)
+	}
+	defer syscall.Close(fd)
+
+	var buf [112]byte
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd),
+		uintptr(xfsIocFsGeometryV4), uintptr(unsafe.Pointer(&buf[0]))); errno != 0 {
+		return XFSGeometry{}, fmt.Errorf("FSGEOMETRY ioctl on %s: %w", path, errno)
+	}
+
+	return XFSGeometry{
+		BlockSize: *(*uint32)(unsafe.Pointer(&buf[0])),
+		AGBlocks:  *(*uint32)(unsafe.Pointer(&buf[8])),
+		AGCount:   *(*uint32)(unsafe.Pointer(&buf[12])),
+		InodeSize: *(*uint32)(unsafe.Pointer(&buf[24])),
+		Flags:     *(*uint32)(unsafe.Pointer(&buf[92])),
+	}, nil
 }
 
 // xfsMount is one discovered XFS filesystem.

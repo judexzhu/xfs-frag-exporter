@@ -16,9 +16,9 @@ scrapeInterval: 300s # GETFSMAP walk cost scales with fragmentation
 resources:
   requests:
     cpu: 10m
-    memory: 32Mi
-  limits:
     memory: 64Mi
+  limits:
+    memory: 256Mi
 
 # Least-privilege by default: GETFSMAP free-space reads need no privileged/caps.
 # If a cluster's SELinux/permissions block opening host mounts, set
@@ -67,5 +67,4 @@ prometheusRule:
   smallExtentRatio: "0.90" # PRIMARY: fraction of free extents < 64 KiB (incident nodes 0.95-0.98)
   avgExtentMinBytes: "65536" # CORROBORATING: avg free extent < 16 blocks (RHEL-82924 / EKS)
   fragRatePerDay: "1.05" # secondary/info only; rate-based, false-positive prone
-  maxExtentRatio: "0.10" # MAX_EXT as a fraction of an allocation group
-  agsizeBytes: "1434976256" # fleet constant (350336 blks x 4096); replace per-fleet
+  maxExtentRatio: "0.10" # MAX_EXT as a fraction of an allocation group (uses xfs_agsize_bytes metric)
