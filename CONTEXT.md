@@ -24,9 +24,10 @@ tests, and code. No implementation detail here — see the SPEC and ADRs for tha
   heavy-tail distributions the byte-average misses (field evidence: node-71
   had avg 424 KiB — above the floor — yet 97.6% of extents were tiny).
 
-- **Average free extent size** (`xfs_free_extent_avg_bytes`) — `free_bytes /
-  free_extents`, the mean contiguous free run. **Corroborating signal** (refined
-  by [[ADR-0004]]): critical below 16 blocks (64 KiB), matching AWS EKS's
+- **Average free extent size** (`xfs_free_extent_avg_blocks`, also
+  `xfs_free_extent_avg_bytes`) — `free_bytes / free_extents / block_size`, the
+  mean contiguous free run in blocks. **Corroborating signal** (refined by
+  [[ADR-0004]]): critical below 16 blocks, matching AWS EKS's
   `XFSSmallAverageClusterSize` (a provisional threshold — their TODO says
   "collect data to get an accurate value"). Can miss heavy-tail cases where a
   few large extents inflate the mean. The exact reciprocal of `frag density`

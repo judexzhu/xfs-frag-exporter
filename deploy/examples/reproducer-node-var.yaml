@@ -39,7 +39,7 @@ metadata:
   labels: { app: xfs-var-fragmenter }
 spec:
   restartPolicy: Never
-  nodeName: ip-10-0-2-196.eu-west-3.compute.internal
+  nodeName: EDIT-ME  # oc get nodes -o name | head -1
   tolerations:
     - operator: Exists
   containers:
