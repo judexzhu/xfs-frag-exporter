@@ -27,7 +27,7 @@ spec:
         - name: exporter
           # Built + pushed by .github/workflows/build.yml. Make the GHCR package
           # public once so nodes can pull without an image pull secret.
-          image: ghcr.io/judexzhu/xfs-frag-exporter:v0.2.0
+          image: ghcr.io/judexzhu/xfs-frag-exporter:v0.3.0
           ports:
             - name: metrics
               containerPort: 9101
