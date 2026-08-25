@@ -1,2 +1,5 @@
 /xfs-frag-exporter
 *.log
+.DS_Store
+docs/eli5-*.html
+docs/*.prototype.html
