@@ -17,13 +17,20 @@ tests, and code. No implementation detail here — see the SPEC and ADRs for tha
 - **Free extent** — one contiguous run of free blocks, as reported by
   `GETFSMAP` (`fmr_owner == FMR_OWN_FREE`). Lengths are in bytes.
 
+- **Small-extent fraction** (`xfs_free_extents_small / xfs_free_extents`) —
+  the share of free extents smaller than 64 KiB (16 blocks). **The primary
+  sick-node signal** (see [[ADR-0004]]): critical above 0.90, where XFS can
+  return ENOSPC despite free space (RHEL-82924). Count-based, so it catches
+  heavy-tail distributions the byte-average misses (field evidence: node-71
+  had avg 424 KiB — above the floor — yet 97.6% of extents were tiny).
+
 - **Average free extent size** (`xfs_free_extent_avg_bytes`) — `free_bytes /
-  free_extents`, the mean contiguous free run. **The primary, field-validated
-  sick-node signal**: **critical below 16 blocks (64 KiB)**, where XFS can return
-  ENOSPC despite free space (`df` and `df -i` both healthy — free-space
-  fragmentation, not inode exhaustion; RHEL-82924). Matches AWS EKS's
-  `XFSSmallAverageClusterSize`. The exact reciprocal of `frag density` (see
-  [[ADR-0003]]).
+  free_extents`, the mean contiguous free run. **Corroborating signal** (refined
+  by [[ADR-0004]]): critical below 16 blocks (64 KiB), matching AWS EKS's
+  `XFSSmallAverageClusterSize` (a provisional threshold — their TODO says
+  "collect data to get an accurate value"). Can miss heavy-tail cases where a
+  few large extents inflate the mean. The exact reciprocal of `frag density`
+  (see [[ADR-0003]]).
 
 - **frag density** (`frag_density`) — `free_extents / free_GiB`. For a fixed block
   size this is the exact reciprocal of average free extent size (`262144 /

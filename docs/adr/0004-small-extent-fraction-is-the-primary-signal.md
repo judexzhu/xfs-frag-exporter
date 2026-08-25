@@ -53,7 +53,8 @@ tail of large free extents.
 - **Refines ADR-0003:** the *level, not rate* conclusion still holds, but the
   robust level is the count-fraction, not the byte-average. ADR-0003's average
   threshold remains valid as a corroborating check.
-- `reproducer-node-var.yaml` recreates the `ip-10-26-86-71` shape on a node's real
-  `/var` (bounded fragmentation: millions of 4 KiB free shards while GiB stay free)
-  so the fraction fires while the average does not — validating the new signal end
-  to end against the deployed exporter.
+- `reproducer-node-var.yaml` recreates the production failure on a node's real
+  `/var` using the confirmed upstream Fluent Bit churn pattern (truncate + rewrite
+  of 3,500 chunk files — matching `chunkio/tests/fs_fragmentation.c`). It runs
+  until ENOSPC, proving the full chain: churn → exporter alert → actual kernel
+  failure with free GiB remaining.

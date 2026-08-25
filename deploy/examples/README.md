@@ -1,147 +1,248 @@
-# Reproducers — validating that the exporter catches the real bug
+# Reproducer & Diagnostic Tools
 
-Three manifests here reproduce the XFS free-space-fragmentation problem that hits
-long-lived OpenShift / ROSA HCP nodes (Red Hat kernel tracking **RHEL-82924**,
-Jira **RFE-9762**), and prove `xfs-frag-exporter` detects it.
+## Overview
 
-| File | Goal | Verified? |
-|---|---|---|
-| [`reproducer-node-var.yaml`](./reproducer-node-var.yaml) | The **field-evidence state** on the node's real `/var` — free space shattered into tiny extents while GiB stay free — caught by the deployed exporter via `xfs_free_extents_small`. Bounded; does not fill `/var` | Detection reproduced |
-| [`reproducer.yaml`](./reproducer.yaml) | Prove **detection** — drive avg free extent below the danger floor and show the exporter reports it, matching `xfs_spaceman` | **Yes** (live) |
-| [`reproducer-enospc.yaml`](./reproducer-enospc.yaml) | The actual **`creat()` ENOSPC with free space** on `sparse=1`, mimicking Fluent Bit small-file churn | **Yes** (live) |
+This directory contains a reproducer for the XFS free-space fragmentation
+ENOSPC bug (RHEL-82924) and a diagnostic script to identify the culprit
+process on affected nodes.
 
-## The concept
-
-**Symptom:** XFS returns `ENOSPC` ("no space left on device") while `df`/`du`
-still show many free GiB and `df -i` shows free inodes. On ROSA HCP this is
-confirmed to be **free-space fragmentation**, not inode exhaustion, and the
-**trigger is the Fluent Bit / fluentd filesystem buffer** — its create/delete
-churn of many small files scatters free space into tiny, non-contiguous extents
-over weeks. (Kernel tracing on affected nodes showed fluent-bit generating ~42×
-more XFS extent allocations than any other process.)
-
-**Why `sparse=1` (the ROSA HCP default, which customers cannot change) is not
-immunity.** XFS allocates inodes in 64-inode chunks. Without sparse inodes a
-chunk needs **8 contiguous aligned blocks** (32 KiB). Sparse inodes lower that to
-**one inode cluster = 2 contiguous blocks** (8 KiB, at 512 B inodes) — but not to
-zero. So once free space is fragmented to **isolated single 4 KiB blocks with no
-2-block run left anywhere**, even a sparse inode cluster can't be allocated and
-`creat()` fails with `ENOSPC` while free single blocks remain.
-
-```
-healthy:   [free 1 GiB contiguous..................]   creat() OK
-fragmented:[F][X][F][X][F][X][F][X][F][X][F][X][F][X]   no 2-block run -> creat() ENOSPC
-           F = free 4 KiB block   X = allocated 4 KiB block
-```
-
-## How the exporter finds it
-
-`xfs-frag-exporter` issues `XFS_IOC_GETFSMAP` and aggregates every free extent. The
-**primary signal is the fraction of free extents under 64 KiB** (16 blocks):
-
-```
-xfs_free_extents_small / xfs_free_extents > 0.90
-```
-
-This is what fired on every live-incident node in the field evidence (0.95–0.98).
-It is COUNT-based, which matters: the **byte-average** `xfs_free_extent_avg_bytes`
-(= `xfs_free_bytes / xfs_free_extents`) is a good corroborating level and matches
-the quantity **AWS EKS's Node Monitoring Agent** alerts on (`XFSSmallAverageClusterSize`,
-avg < 16 blocks) — but a few large free extents keep the mean high even when almost
-every extent is tiny. The customer's live-incident node `ip-10-26-86-71` had 264 GB
-free across 652,406 extents (avg ~424 KiB, **above** the 64 KiB floor) yet **97.6%
-of extents were < 60 KiB** — the average would have missed it; the fraction caught
-it. OpenShift has no built-in equivalent of either, which is what RFE-9762 asks for.
-
-The reproducers cross-check the exporter against `xfs_spaceman -c 'freesp -s'`
-ground truth. In the verified `reproducer.yaml` run (on a `sparse=1` fs):
-
-| Source | Average free extent |
+| File | Purpose |
 |---|---|
-| `xfs_spaceman freesp -s` | `1.14908` blocks |
-| exporter `xfs_free_extent_avg_bytes` | `4706 B` (= 1.149 × 4096) — **exact match** |
+| [`reproducer-node-var.yaml`](./reproducer-node-var.yaml) | Reproduce RHEL-82924 on real /var — gradual fragmentation → alert → ENOSPC |
+| [`identify-culprit.sh`](./identify-culprit.sh) | Identify which process/pod is causing fragmentation (ftrace + bpftrace) |
 
-with `xfs_frag_density_extents_per_gib = 228134` (≫ the ~16384 critical level).
+## The bug (RHEL-82924)
 
-### The alerts
+XFS returns `ENOSPC` while `df` shows free GiB and `df -i` shows free inodes.
+This is **free-space fragmentation**, not disk-full or inode exhaustion.
 
-Shipped in [`deploy/prometheusrule.yaml`](../prometheusrule.yaml) /
-`--set prometheusRule.enabled=true`:
+**Customer field evidence:**
 
-```yaml
-- alert: XFSFreeSpaceFragmented          # PRIMARY — count-based, caught the incident nodes
-  expr: xfs_free_extents_small / xfs_free_extents > 0.90
-  for: 30m
-- alert: XFSSmallAverageExtent           # corroborating; == AWS NMA XFSSmallAverageClusterSize
-  expr: xfs_free_extent_avg_bytes < 65536   # 16 blocks x 4 KiB
-  for: 30m
+| Node | Free space | Free extents | Extents < 60 KiB | Avg extent |
+|---|---|---|---|---|
+| ip-10-26-86-71 | 264 GB | 652,406 | **97.6%** | 424 KiB (above 64 KiB floor!) |
+| ip-10-26-86-145 | — | — | 96.3% | — |
+| ip-10-26-86-34 | — | — | 95.3% | — |
+
+The byte-average (424 KiB) **missed** the problem — a few large free extents
+inflated the mean. The count-based signal (97.6% tiny) caught it.
+
+**Root cause:** Fluent Bit's `CIO_TRIM_FILES` behavior — truncate chunk files
+to zero, then rewrite — keeps inodes alive while freeing data blocks. New
+writes scatter across AGs. Over weeks, free space fragments into millions of
+isolated single-block extents. When inode chunk allocation needs 2+ contiguous
+blocks and can't find them in any AG → ENOSPC with free space remaining.
+
+## Reproducer
+
+### What scenario it reproduces
+
+The reproducer recreates the exact field-evidence state: 99%+ of free extents
+are smaller than 64 KiB while GiB remain free. It then drives `creat()` until
+actual ENOSPC — the full RHEL-82924 failure chain.
+
+It is designed as a **monitoring demo** showing the exporter catching the
+problem before ENOSPC hits:
+
 ```
-PromQL for ad-hoc checks:
-```promql
-xfs_free_extents_small / xfs_free_extents > 0.90   # PRIMARY: most free extents tiny
-xfs_free_extent_avg_bytes < 65536                  # corroborating 16-block floor
-topk(10, xfs_frag_density_extents_per_gib)         # rank worst mounts (reciprocal signal)
+Phase 1: Fill     → fallocate REGION_GB on /var          (seconds)
+Phase 2: Punch    → 10 gradual rounds, 120s pause each   (~20 minutes)
+  round 1  → ratio ~10%  (healthy)
+  round 5  → ratio ~50%  (degrading)
+  round 9  → ratio ~90%  → XFSFreeSpaceFragmented FIRES
+  round 10 → ratio ~99%  (critical)
+Phase 3: creat()  → empty files until ENOSPC             (minutes-hours)
 ```
 
-## How to use
+### Why this approach
 
-### Real-world: node `/var` + deployed exporter (`reproducer-node-var.yaml`)
+**Decision: fill + punch, not truncate + rewrite churn**
 
-Non-privileged (non-root, emptyDir, no loop/mount/hostPath). Edit `nodeName`, make
-sure the exporter DaemonSet is deployed with `--set resources.limits.memory=512Mi`
-(millions of extents need headroom), then:
+We initially tried the Fluent Bit churn pattern (truncate + rewrite 350K files)
+on real /var. It didn't work for a fast reproducer because:
+
+- On a 300 GB disk at <20% usage, XFS has abundant contiguous space. Delayed
+  allocation (`delalloc`) coalesces small writes into large extents. The
+  small-extent ratio actually **dropped** during churn.
+- The production bug takes **weeks** of churn to manifest. A reproducer that
+  takes weeks isn't useful for demos or validation.
+
+Instead we adopted the canonical **xfstests/xfs/076** pattern (Brian Foster,
+Red Hat, 2015) — the kernel's own test for this exact failure mode:
+
+1. Fill the region to 100% with one file (`fallocate`)
+2. Punch alternating holes (`FALLOC_FL_PUNCH_HOLE`) so every free extent is
+   isolated and smaller than an inode chunk
+3. Allocate inodes until ENOSPC
+
+This creates the **same free-space distribution** as weeks of churn, in
+minutes. The gradual 10-round punching was added so the exporter scrapes the
+climbing ratio and the `XFSFreeSpaceFragmented` alert fires before ENOSPC —
+demonstrating the monitoring value.
+
+### References
+
+| Source | What we used | Link |
+|---|---|---|
+| xfstests/xfs/076 | Fill + punch + creat pattern | [kdave/xfstests tests/xfs/076](https://github.com/kdave/xfstests/blob/acb6d4cb/tests/xfs/076) |
+| fluent-bit chunkio test | Confirmed truncate-on-close causes fragmentation | [fluent/fluent-bit lib/chunkio/tests/fs_fragmentation.c](https://github.com/fluent/fluent-bit/blob/51af5494/lib/chunkio/tests/fs_fragmentation.c) |
+| EKS Node Monitoring Agent | Threshold reference (avg < 16 blocks, provisional) | [aws/eks-node-monitoring-agent monitors/storage/monitor.go:225](https://github.com/aws/eks-node-monitoring-agent/blob/51af5494/monitors/storage/monitor.go#L225) |
+| amazon-eks-ami #1224 | Field evidence of ENOSPC from free-space fragmentation | [awslabs/amazon-eks-ami#1224](https://github.com/awslabs/amazon-eks-ami/issues/1224) |
+| fluent-bit #7034 | Fluent Bit issue tracking the XFS fragmentation problem | [fluent/fluent-bit#7034](https://github.com/fluent/fluent-bit/issues/7034) |
+| Red Hat KCS 7110315 | ENOSPC when free space is highly fragmented | [access.redhat.com/solutions/7110315](https://access.redhat.com/solutions/7110315) |
+
+### Usage
+
+Edit `nodeName` in the YAML. Deploy the exporter with enough memory for
+millions of extents:
+
+```sh
+helm upgrade xfs-frag-exporter ./chart/xfs-frag-exporter -n default \
+  --set rbac.sccBinding=true --set clusterMonitoring.enabled=true \
+  --set prometheusRule.enabled=true --set resources.limits.memory=512Mi
+```
+
+Deploy and watch:
 
 ```sh
 oc apply -f deploy/examples/reproducer-node-var.yaml
-oc logs -f xfs-var-fragmenter                 # rounds of "isolated 4 KiB free shards"
-# then query the DEPLOYED exporter for that node:
-#   xfs_free_extents_small{node="<node>"} / xfs_free_extents{node="<node>"}   -> > 0.90
-#   xfs_free_extent_avg_bytes{node="<node>"}                                  -> stays > 65536
-oc delete pod xfs-var-fragmenter              # emptyDir freed, /var extents coalesce
+oc logs -f xfs-var-fragmenter
+
+# Monitor in Prometheus:
+#   xfs_free_extents_small{node="<node>"} / xfs_free_extents{node="<node>"}
 ```
 
-Knob (pod `env`): `REGION_GB` (default 24) — bounds the fragmented region; net
-`/var` use self-caps at ~`REGION_GB/2`. Raise it to push the average down too.
+### Configuration
 
-### Isolated loopback (`reproducer.yaml`, `reproducer-enospc.yaml`)
+| Env var | Default | Meaning |
+|---|---|---|
+| `REGION_GB` | 200 | Size of region to fragment. After punching, ~REGION_GB/2 is free-but-fragmented |
+| `ROUNDS` | 10 | Number of punch rounds (controls gradient for demo) |
+| `ROUND_PAUSE_SEC` | 120 | Seconds between rounds for exporter to scrape |
 
-Both need the `privileged` SCC (loop device + `mount`) — run on a **throwaway /
-test node**. Each writes a small loopback image to node `/var` (emptyDir),
-auto-removed on delete.
+### Success criteria
+
+1. `XFSFreeSpaceFragmented` fires (ratio > 0.90) **before** ENOSPC
+2. Actual ENOSPC on `creat()`
+3. `df` still shows free GiB at the moment of ENOSPC
+4. Exporter metrics match field evidence shape (99%+ small extents)
+
+## Diagnostic: identify the culprit
+
+When `XFSFreeSpaceFragmented` fires on a customer node, the next question is
+**"which process/pod is causing it?"**
+
+`identify-culprit.sh` answers this using kernel ftrace — zero install, works
+on any RHCOS node. It traces XFS extent allocations for a configurable duration
+and maps each PID to its pod namespace/name via cgroup → CRI-O.
+
+### How it works
+
+The script enables the `xfs_alloc_near_first` kernel tracepoint via
+`/sys/kernel/debug/tracing/`. Every time XFS allocates a block (data, inode
+chunk, or metadata), the kernel records which process requested it. After
+the trace window, the script counts events per PID and resolves each to a pod.
+
+### Method 1: ftrace (recommended — zero install)
 
 ```sh
-# Prove detection (fast, safe, verified):
-oc apply -f deploy/examples/reproducer.yaml
-oc -n xfs-repro logs -f xfs-repro          # watch freesp -s vs exporter metrics
+# Copy script to node and run:
+oc debug node/<sick-node> -- chroot /host bash identify-culprit.sh
 
-# Attempt the actual ENOSPC (mimics fluentd churn):
-oc apply -f deploy/examples/reproducer-enospc.yaml
-oc -n xfs-repro logs -f xfs-enospc
-
-# Clean up (detach the host loop device, then remove the namespace):
-oc -n xfs-repro exec <pod> -- sh -c 'umount /mnt/x; losetup -D'
-oc delete ns xfs-repro
+# Or inline:
+oc debug node/<sick-node> -- chroot /host bash -c '
+  echo > /sys/kernel/debug/tracing/trace
+  echo 1 > /sys/kernel/debug/tracing/events/xfs/xfs_alloc_near_first/enable
+  timeout 10 cat /sys/kernel/debug/tracing/trace_pipe > /tmp/t.txt 2>/dev/null
+  echo 0 > /sys/kernel/debug/tracing/events/xfs/xfs_alloc_near_first/enable
+  awk "{split(\$1,a,\"-\"); pid=a[length(a)]; comm=\$1; gsub(/-[0-9]+$/,\"\",comm); print pid, comm}" /tmp/t.txt | sort | uniq -c | sort -rn | head -5
+'
 ```
 
-Knobs (pod `env`): `FS_GB` sizes the loopback filesystem.
-
-### Verified result (sparse=1 loopback)
-
-`reproducer-enospc.yaml`, run to completion:
+Example output:
 
 ```
-creat() failed: /mnt/x/churn/f_73149: No space left on device
-df -h:  /dev/loop2  960M  554M  407M  58%     <- 42% of blocks FREE
-df -i:  /dev/loop2  524288 78784 445504 16%   <- 84% of inodes FREE
-freesp -s: 113,886 free extents, average 1.00003 blocks
-exporter:  xfs_free_extent_avg_bytes = 4096   (density 262137)  <- matches freesp -s
+  1539  frag             3807125     default/xfs-var-fragmenter
+     2  kworker/0:0      12345       (host)
+     1  kworker/u16:2    67890       (host)
 ```
 
-ENOSPC with 42% of blocks and 84% of inodes free — pure free-space fragmentation
-on `sparse=1`. Exactly RHEL-82924. The exporter's `xfs_free_extent_avg_bytes`
-tracked the ground truth to the block and sat far below the 64 KiB alert floor.
+### Method 2: bpftrace (richer detail, needs dnf install)
 
-> Note: why it must PUNCH, not delete — `rm` frees the inode slot too, so plain
-> create/delete churn recycles inodes and slides into ordinary "disk full"
-> instead. Freeing data while keeping the inode (truncate/punch, as log rotation
-> does) is what strands the inodes and forces the failing new-cluster allocation.
+bpftrace is **not installed** on RHCOS and the node has **no Red Hat
+subscription** (ROSA HCP). Use a CentOS Stream 9 debug image instead:
+
+```sh
+oc debug node/<sick-node> --image=quay.io/centos/centos:stream9
+# Inside:
+dnf install -y bpftrace
+mount -t debugfs debugfs /sys/kernel/debug
+
+# Count allocations per process (30s):
+timeout 30 bpftrace -e '
+  tracepoint:xfs:xfs_alloc_near_first { @[comm, pid] = count(); }'
+
+# Distinguish inode vs data allocation:
+timeout 30 bpftrace -e '
+  tracepoint:xfs:xfs_alloc_vextent_near_bno {
+    @allocs[comm, pid] = count();
+    if (args->alignment == 8 && args->minlen == 8) {
+      @inode_allocs[comm, pid] = count();
+    }
+  }'
+
+# Catch allocation failures (the ENOSPC moment):
+timeout 30 bpftrace -e '
+  tracepoint:xfs:xfs_alloc_vextent_allfailed { @[comm, pid] = count(); }'
+```
+
+**Note:** bpftrace runs inside the CentOS container but `crictl` is on the
+host. Map PID → pod from a **separate** `oc debug node` session:
+
+```sh
+oc debug node/<sick-node>
+chroot /host
+PID=<pid from bpftrace output>
+CID=$(sed -n 's|.*crio-\([a-f0-9]*\)\.scope|\1|p' /proc/$PID/cgroup)
+crictl inspect --output go-template \
+  --template '{{index .status.labels "io.kubernetes.pod.namespace"}}/{{index .status.labels "io.kubernetes.pod.name"}}' \
+  "${CID:0:13}"
+```
+
+### Tracepoints reference
+
+| Tracepoint | Fires when | Use for |
+|---|---|---|
+| `xfs_alloc_near_first` | XFS searches an AG for free space | General allocator pressure (default) |
+| `xfs_alloc_vextent_near_bno` | One per allocation request (entry point) | Precise count; has minlen/alignment fields |
+| `xfs_alloc_vextent_allfailed` | All AGs exhausted — allocation fails | Catching the ENOSPC-causing process |
+| `xfs_alloc_file_space` | File data allocation (fallocate) | File-only, excludes inode allocation |
+
+Note: `xfs_alloc_extent` (referenced in some docs) does **not exist** on RHEL
+9 kernel 5.14. Use the tracepoints above.
+
+### References
+
+| Source | Link |
+|---|---|
+| KCS: How to run bpftrace on OpenShift 4 | [access.redhat.com/solutions/7105671](https://access.redhat.com/solutions/7105671) |
+| KCS: What is bpftrace | [access.redhat.com/solutions/6904611](https://access.redhat.com/solutions/6904611) |
+| KCS: Running BPFTrace on OCP4 for network analysis | [access.redhat.com/articles/7146080](https://access.redhat.com/articles/7146080) |
+
+## Legacy reproducers (retired)
+
+`reproducer.yaml` and `reproducer-enospc.yaml` used synthetic punch-hole
+fragmentation on isolated loopback filesystems. They proved detection works
+but don't match the real-world scenario or demonstrate the monitoring story.
+Kept for reference only.
+
+## Alerts
+
+```yaml
+- alert: XFSFreeSpaceFragmented          # PRIMARY — count-based
+  expr: xfs_free_extents_small / xfs_free_extents > 0.90
+  for: 30m
+- alert: XFSSmallAverageExtent           # corroborating
+  expr: xfs_free_extent_avg_bytes < 65536
+  for: 30m
+```

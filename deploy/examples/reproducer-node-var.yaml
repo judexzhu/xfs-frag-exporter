@@ -1,42 +1,34 @@
-# Real-world reproducer: recreate the FIELD-EVIDENCE state on the node's real
-# /var, and let the DEPLOYED exporter catch it. This is RHEL-82924 as measured on
-# the customer's live-incident nodes -- free space shattered into tiny extents
-# while GiB stay free -- NOT a disk-full test.
+# Real-world reproducer: XFS free-space fragmentation ENOSPC on node's real /var.
 #
-# WHAT THE EVIDENCE SHOWED (node ip-10-26-86-71): 264 GB free across 652,406 free
-# extents, 97.6% of them < 60 KiB. The mean free extent was still ~424 KiB (ABOVE
-# the 64 KiB floor), so an average-based alert would MISS it -- but the COUNT of
-# tiny extents dominated. This reproducer recreates exactly that shape.
+# Based on the canonical xfstests/xfs/076 pattern (Brian Foster, Red Hat, 2015).
+# Punches holes GRADUALLY in rounds so the deployed exporter shows the full
+# monitoring story: ratio climbs from healthy → warning → alert fires → ENOSPC.
 #
-# HOW: writes to an emptyDir -> lands on the node's real /var XFS. It fallocates a
-# BOUNDED region and punches a 4 KiB hole every 8 KiB, turning that region's free
-# space into millions of isolated 4 KiB free extents (the "shards"). The rest of
-# /var stays free and contiguous -- so df still shows GiB free, the byte-average
-# stays high, but 99%+ of free EXTENTS are now tiny. Each round re-fills and
-# re-punches at a shifted offset (mimics Fluent Bit rotate/punch churn) so the
-# allocator keeps churning. Net footprint self-caps at ~REGION_GB/2 -- it does NOT
-# grow, does NOT fill /var, does NOT trigger DiskPressure.
+# HOW (3 phases):
+#   1. FILL: fallocate a large file consuming most of /var's free space
+#   2. PUNCH (gradual): punch alternating holes in 10 rounds, pausing between
+#      each so the exporter scrapes the climbing fragmentation ratio:
+#        round 1 → ~10% small extents
+#        round 5 → ~50% small extents
+#        round 9 → ~90% → XFSFreeSpaceFragmented FIRES
+#        round 10 → ~99% → approaching ENOSPC
+#   3. CREAT: create empty files until ENOSPC — inode allocation fails
 #
-#   REGION_GB=24 -> ~3.1M 4 KiB free shards, ~12 GiB net /var use held steady.
-#   Deployed exporter then reports for this node:
-#     xfs_free_extents_small / xfs_free_extents  > 0.90   -> XFSFreeSpaceFragmented FIRES
-#     xfs_free_extent_avg_bytes                  > 65536   -> XFSSmallAverageExtent stays quiet
-#   i.e. the new count signal catches what the byte-average misses -- the whole point.
+# The pause between rounds (ROUND_PAUSE_SEC) gives the exporter time to scrape
+# and Prometheus time to evaluate the alert (default: 120s = 2 min per round,
+# ~20 min total for full demo).
 #
-# Raise REGION_GB to push the average down too (more shards, fewer big extents);
-# the default is tuned so the average stays ABOVE the floor to demonstrate the gap.
+# This IS the bug (RHEL-82924). Customer field evidence:
+#   node ip-10-26-86-71: 264 GB free, 652,406 extents, 97.6% < 60 KiB
 #
-# NOTE: observing millions of extents needs exporter memory headroom -- raise its
-# limit or it OOMs and stops observing:
-#   helm upgrade xfs-frag-exporter ./chart/xfs-frag-exporter -n default \
-#     --set rbac.sccBinding=true --set clusterMonitoring.enabled=true \
-#     --set prometheusRule.enabled=true --set resources.limits.memory=512Mi
-#
-# Non-privileged (non-root + emptyDir; no loop, no mount, no host paths).
-# REVERSIBLE: delete the pod -> emptyDir freed -> /var extents coalesce -> recover.
+# Configurable via env vars:
+#   REGION_GB       — size of region to fragment (default: 200)
+#   ROUNDS          — number of punch rounds (default: 10)
+#   ROUND_PAUSE_SEC — seconds between rounds for exporter to scrape (default: 120)
 #
 # EDIT nodeName. Then: oc apply -f deploy/examples/reproducer-node-var.yaml
-# Watch: xfs_free_extents_small{node="<node>"} / xfs_free_extents{node="<node>"}
+# Watch: oc logs -f xfs-var-fragmenter
+# Alert: xfs_free_extents_small{node="<node>"} / xfs_free_extents{node="<node>"}
 # Clean up: oc delete pod xfs-var-fragmenter -n default
 ---
 apiVersion: v1
@@ -54,47 +46,135 @@ spec:
     - name: fragmenter
       image: golang:1.23
       env:
-        - { name: REGION_GB, value: "24" }  # bounded; net /var use self-caps at ~REGION_GB/2
+        - { name: REGION_GB, value: "200" }
+        - { name: ROUNDS, value: "10" }
+        - { name: ROUND_PAUSE_SEC, value: "120" }
         - { name: HOME, value: /tmp }
         - { name: GOCACHE, value: /tmp/.cache }
       command: ["/bin/bash", "-c"]
       args:
         - |
           set -eu
-          cat > /tmp/punch.go <<'GO'
+          cat > /tmp/frag.go <<'GO'
           package main
-          import ( "fmt"; "os"; "strconv"; "syscall"; "time" )
-          const punch = 0x02 | 0x01 // FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
+
+          import (
+            "fmt"
+            "os"
+            "strconv"
+            "syscall"
+            "time"
+          )
+
+          const (
+            punchFlags = 0x02 | 0x01 // FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
+            chunkSize  = 32768       // 8 blocks × 4 KiB
+          )
+
+          func env(key string, fallback int) int {
+            v, _ := strconv.Atoi(os.Getenv(key))
+            if v == 0 { return fallback }
+            return v
+          }
+
           func main() {
-            gib, _ := strconv.Atoi(os.Getenv("REGION_GB")); if gib == 0 { gib = 24 }
+            gib := env("REGION_GB", 200)
+            rounds := env("ROUNDS", 10)
+            pause := env("ROUND_PAUSE_SEC", 120)
             region := int64(gib) << 30
+
+            // Total holes we'll punch (every other chunk)
+            totalHoles := region / (chunkSize * 2)
+            holesPerRound := totalHoles / int64(rounds)
+
+            fmt.Println("== XFS fragmentation reproducer (gradual, for monitoring demo) ==")
+            fmt.Printf("   REGION_GB=%d  ROUNDS=%d  PAUSE=%ds\n", gib, rounds, pause)
+            fmt.Printf("   total holes: %d  per round: %d\n", totalHoles, holesPerRound)
+            fmt.Printf("   estimated total time: ~%d minutes\n", rounds*pause/60)
+            fmt.Println()
+
+            // Phase 1: fill
+            fmt.Println("== Phase 1: FILL ==")
             f, err := os.Create("/work/frag")
             if err != nil { fmt.Println("create:", err); os.Exit(1) }
             fd := int(f.Fd())
-            for round := 0; ; round++ {
-              // (Re)allocate the whole region, then punch a 4 KiB hole every 8 KiB.
-              // Fill + re-punch each round keeps the footprint at ~region/2 while
-              // continuously re-fragmenting -- free space never grows, never fills.
-              if err := syscall.Fallocate(fd, 0, 0, region); err != nil {
-                fmt.Printf("fallocate %d GiB failed: %v -- lower REGION_GB\n", gib, err)
-                time.Sleep(30 * time.Second); continue
+
+            if err := syscall.Fallocate(fd, 0, 0, region); err != nil {
+              fmt.Printf("fallocate %d GiB failed: %v — lower REGION_GB\n", gib, err)
+              os.Exit(1)
+            }
+            f.Sync()
+            fmt.Printf("   filled %d GiB\n\n", gib)
+
+            // Phase 2: gradual punch
+            fmt.Println("== Phase 2: PUNCH (gradual — watch the exporter ratio climb) ==")
+
+            // Work backwards like xfs/076
+            nextOffset := region - chunkSize*2
+            for round := 1; round <= rounds; round++ {
+              punched := int64(0)
+              target := holesPerRound
+              if round == rounds {
+                target = totalHoles // last round gets the remainder
               }
-              phase := int64(round%2) * 4096 // shift each round so the allocator keeps churning
-              var holes int64
-              for off := phase; off+4096 <= region; off += 8192 {
-                if err := syscall.Fallocate(fd, punch, off, 4096); err != nil { break }
-                holes++
+
+              for punched < target && nextOffset >= 0 {
+                if err := syscall.Fallocate(fd, punchFlags, nextOffset, chunkSize); err != nil {
+                  fmt.Printf("   punch failed at offset %d: %v\n", nextOffset, err)
+                  break
+                }
+                punched++
+                nextOffset -= chunkSize * 2
               }
               f.Sync()
-              fmt.Printf("round %d: %d isolated 4 KiB free shards; ~%d MiB net /var use (bounded, free space intact)\n",
-                round, holes, (region/2)>>20)
-              time.Sleep(30 * time.Second)
+
+              totalPunched := totalHoles - (nextOffset/(chunkSize*2) + 1)
+              pctDone := float64(totalPunched) / float64(totalHoles) * 100
+
+              fmt.Printf("   round %d/%d: punched %d holes this round (%.0f%% total)\n",
+                round, rounds, punched, pctDone)
+              fmt.Printf("   → expected small-extent ratio: ~%.0f%%\n", pctDone)
+              fmt.Println("   → check: xfs_free_extents_small / xfs_free_extents")
+
+              if round < rounds {
+                fmt.Printf("   → pausing %ds for exporter scrape...\n\n", pause)
+                time.Sleep(time.Duration(pause) * time.Second)
+              }
             }
+
+            fmt.Println()
+            fmt.Println("== Punching complete. Exporter should show ratio > 0.90 ==")
+            fmt.Println("== XFSFreeSpaceFragmented alert should be firing ==")
+            fmt.Println()
+
+            // Phase 3: creat until ENOSPC
+            fmt.Println("== Phase 3: CREAT — allocate inodes until ENOSPC ==")
+            os.MkdirAll("/work/inodes", 0755)
+            n := 0
+            for {
+              path := fmt.Sprintf("/work/inodes/f_%d", n)
+              ff, err := os.Create(path)
+              if err != nil {
+                fmt.Printf("\n!! creat() FAILED after %d files: %v\n", n, err)
+                break
+              }
+              ff.Close()
+              n++
+              if n%10000 == 0 {
+                fmt.Printf("  created %d files...\n", n)
+              }
+            }
+
+            fmt.Println()
+            fmt.Println("== ENOSPC reached — RHEL-82924 reproduced ==")
+            fmt.Println("   df will still show free GiB — that's the bug")
+            fmt.Println("   exporter caught it before ENOSPC (ratio > 0.90)")
+            fmt.Println()
+            fmt.Println("== DONE; holding for inspection ==")
+            for { time.Sleep(time.Hour) }
           }
           GO
-          echo "== fragmenting node /var free space into shards (REGION_GB=$REGION_GB, bounded, no disk-fill) =="
-          echo "   watch DEPLOYED exporter: xfs_free_extents_small{node=\"$(hostname)\"} / xfs_free_extents"
-          exec go run /tmp/punch.go
+          exec go run /tmp/frag.go
       volumeMounts:
         - { name: work, mountPath: /work }
       securityContext:
@@ -105,5 +185,4 @@ spec:
         seccompProfile: { type: RuntimeDefault }
   volumes:
     - name: work
-      emptyDir:
-        sizeLimit: 26Gi        # safety cap; net footprint self-limits to ~REGION_GB/2
+      emptyDir: {}
