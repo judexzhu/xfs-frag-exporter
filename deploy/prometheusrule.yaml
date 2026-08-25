@@ -65,7 +65,7 @@ spec:
         # space is uniformly shredded; it can miss a heavy tail of large extents
         # (see the header note on node ip-10-26-86-71), so do not rely on it alone.
         - alert: XFSSmallAverageExtent
-          expr: xfs_free_extent_avg_bytes < 65536
+          expr: xfs_free_extent_avg_blocks < 16
           for: 30m
           labels:
             severity: warning

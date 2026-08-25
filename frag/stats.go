@@ -58,6 +58,16 @@ func (s Stats) Density() float64 {
 	return float64(s.Extents) / (float64(s.FreeBytes) / bytesPerGiB)
 }
 
+// AvgExtentBlocks is the mean free-extent size in filesystem blocks (4 KiB).
+// Below 16 blocks, XFS can ENOSPC with free space left (RHEL-82924). This is
+// the same quantity AWS EKS's XFSSmallAverageClusterSize alerts on (< 16).
+func (s Stats) AvgExtentBlocks() float64 {
+	if s.Extents == 0 {
+		return 0
+	}
+	return float64(s.FreeBytes) / float64(s.Extents) / 4096
+}
+
 // AvgExtentBytes is the mean contiguous free-extent size (free bytes / free
 // extents). When it falls below ~16 blocks (64 KiB) XFS struggles to find
 // contiguous runs and can ENOSPC while free space remains (RHEL-82924); AWS EKS

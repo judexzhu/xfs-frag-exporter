@@ -65,6 +65,6 @@ clusterMonitoring:
 prometheusRule:
   enabled: false
   smallExtentRatio: "0.90" # PRIMARY: fraction of free extents < 64 KiB (incident nodes 0.95-0.98)
-  avgExtentMinBytes: "65536" # CORROBORATING: avg free extent < 16 blocks (RHEL-82924 / EKS)
+  avgExtentMinBlocks: "16" # CORROBORATING: avg free extent < 16 blocks (RHEL-82924 / EKS)
   fragRatePerDay: "1.05" # secondary/info only; rate-based, false-positive prone
   maxExtentRatio: "0.10" # MAX_EXT as a fraction of an allocation group (uses xfs_agsize_bytes metric)

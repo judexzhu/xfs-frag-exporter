@@ -101,6 +101,14 @@ func TestDensityZeroFree(t *testing.T) {
 	}
 }
 
+func TestAvgExtentBlocksFixture(t *testing.T) {
+	got := Aggregate(fixtureExtents()).AvgExtentBlocks()
+	want := 306_131_783_680.0 / 358 / 4096 // ~208,767 blocks (~815 MiB, healthy)
+	if math.Abs(got-want) > 0.01 {
+		t.Fatalf("AvgExtentBlocks = %.2f, want %.2f", got, want)
+	}
+}
+
 func TestAvgExtentBytesFixture(t *testing.T) {
 	got := Aggregate(fixtureExtents()).AvgExtentBytes()
 	const want = 306_131_783_680.0 / 358 // ~855,116,713.6 bytes (~815 MiB, healthy)
